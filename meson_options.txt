@@ -1,0 +1,7 @@
+option('xwayland',
+  type: 'feature',
+  value: 'disabled',
+  description: 'XWayland support for X11 application compatibility. Enable in a later phase — '
+    + 'XWayland has a significant attack surface and requires additional security review '
+    + 'before wiring in. See EVILWAY_CONTEXT.md for notes on XWayland socket permissions '
+    + 'and X11 client isolation.')
