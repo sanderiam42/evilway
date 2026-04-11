@@ -32,6 +32,8 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "window.h"
+
 /*
  * Compositor modifier key.
  *
@@ -44,6 +46,31 @@
  * not user-configurable. All other bindings use the EwConfig bind system.
  */
 #define MODIFIER WLR_MODIFIER_LOGO
+
+/*
+ * Movement and resize constants.
+ *
+ * MOVE_STEP matches evilwm's default 16-pixel keyboard increment for both
+ * move and resize operations. MIN_WIN_CONTENT is the minimum CLIENT content
+ * dimension (not including borders); outer minimum = MIN_WIN_CONTENT + 2*bw.
+ */
+#define MOVE_STEP        16   /* keyboard move/resize step in pixels */
+#define MIN_WIN_CONTENT  32   /* minimum client content width or height */
+
+/*
+ * Border colors as packed RGBA uint32_t (0xRRGGBBAA).
+ *
+ * BORDER_COLOR_ACTIVE matches evilwm's classic gold (#DAA520).
+ * BORDER_COLOR_INACTIVE is dark grey (#444444).
+ *
+ * These are compile-time constants, not config values. Color configuration
+ * will be added in a later pass when the .evilwayrc color keys are defined.
+ *
+ * SECURITY: Both values are literals — no client-supplied input can influence
+ * border rendering colors.
+ */
+#define BORDER_COLOR_ACTIVE   0xDAA520FFu  /* evilwm gold */
+#define BORDER_COLOR_INACTIVE 0x444444FFu  /* dark grey */
 
 /* =========================================================================
  * Runtime config — bind flags, function enum, bind and config structs.
@@ -151,6 +178,22 @@ enum {
 };
 
 /*
+ * EwCursorMode — tracks whether the compositor has an active mouse grab.
+ *
+ * CurNormal:  no grab; pointer events are forwarded to clients normally.
+ * CurMove:    Super+button1 drag in progress; compositor is moving a window.
+ * CurResize:  Super+button2 drag in progress; compositor is resizing a window.
+ *
+ * SECURITY: While cursor_mode != CurNormal, the compositor consumes ALL
+ * pointer motion and button events without forwarding them to any client.
+ * This is enforced in process_cursor_motion() and handle_cursor_button() in
+ * main.c. A client that receives pointer events during a compositor grab is
+ * a correctness bug and a potential security issue (it can observe cursor
+ * position outside its own surface).
+ */
+typedef enum { CurNormal, CurMove, CurResize } EwCursorMode;
+
+/*
  * Server — top-level compositor state.
  *
  * One instance, lives on the stack in main(). Passed by pointer to all
@@ -202,6 +245,26 @@ struct Server {
      * context, not from a signal handler, so malloc is safe. */
     struct wl_event_source       *sighup_source;
 
+    /*
+     * Mouse grab state — active during Super+drag move/resize operations.
+     *
+     * SECURITY: while cursor_mode != CurNormal ALL pointer motion events and
+     * button events are consumed by the compositor and NOT forwarded to any
+     * client. Enforcement is in process_cursor_motion() and
+     * handle_cursor_button() in main.c.
+     *
+     * grab_anchor_x/y serves dual purpose:
+     *   CurMove:   cursor offset from window origin at grab start
+     *              (new_win_x = cursor_x - grab_anchor_x)
+     *   CurResize: position of the anchored (opposite) corner in layout space
+     *              (the drag corner tracks the cursor; anchor corner is fixed)
+     */
+    EwCursorMode      cursor_mode;
+    struct Toplevel  *grab_tl;        /* window being moved/resized */
+    struct wlr_box    grab_geom;      /* window geometry at grab start */
+    int               grab_anchor_x;
+    int               grab_anchor_y;
+
     /* Backend-level listeners */
     struct wl_listener new_output;
     struct wl_listener new_input;
@@ -246,7 +309,30 @@ struct Toplevel {
     struct wl_list             link;        /* Server::toplevels */
     struct Server             *server;
     struct wlr_xdg_toplevel   *xdg_toplevel;
-    struct wlr_scene_tree     *scene_tree;  /* scene_tree->node.data = this */
+
+    /*
+     * Scene graph structure for this window:
+     *
+     *   scene_tree (outer container, in LyrFloat)
+     *   ├── border[0]   top rect,    full width × bw
+     *   ├── border[1]   bottom rect, full width × bw
+     *   ├── border[2]   left rect,   bw × (height - 2*bw)
+     *   ├── border[3]   right rect,  bw × (height - 2*bw)
+     *   └── surface_tree (xdg surface, positioned at (bw, bw))
+     *
+     * scene_tree is positioned at (geom.x, geom.y) in layout space.
+     * scene_tree->node.data = this Toplevel, used by toplevel_at() hit test.
+     *
+     * DESIGN: outer tree + separate surface_tree matches dwl's c->scene /
+     * c->scene_surface split. It lets us size and color borders independently
+     * of the client surface without involving the xdg protocol machinery.
+     */
+    struct wlr_scene_tree     *scene_tree;   /* outer container; node.data = this */
+    struct wlr_scene_tree     *surface_tree; /* xdg surface, at (bw,bw) in outer */
+    struct wlr_scene_rect     *border[4];    /* top, bottom, left, right */
+
+    /* Per-window mutable state: geometry, maximize flags, vdesk, fixed. */
+    EwWindowState              state;
 
     struct wl_listener map;
     struct wl_listener unmap;

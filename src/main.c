@@ -1,8 +1,8 @@
 /*
  * evilWay — Wayland compositor
  *
- * Scaffold: xdg-shell only. Proves the wlroots foundation is correct before
- * any evilwm behavior is layered on top.
+ * Phase 1b: evilwm behavior layer — move/resize, focus-follows-mouse, borders,
+ * stacking, and snap-to-edge, layered on the Phase 1a xdg-shell skeleton.
  *
  * References:
  *   dwl    https://codeberg.org/dwl/dwl    (closest working reference, ~3200 lines)
@@ -37,6 +37,7 @@
 
 #include <assert.h>
 #include <linux/input-event-codes.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +47,16 @@
 
 #include "config.h"
 #include "evilway.h"
+#include "window.h"
+
+/* =========================================================================
+ * Forward declarations — needed because grab helpers call toplevel_at()
+ * which is defined later (after focus/cursor helpers depend on it).
+ * ====================================================================== */
+
+static struct Toplevel *toplevel_at(struct Server *server,
+        double lx, double ly,
+        struct wlr_surface **surface_out, double *sx, double *sy);
 
 /* =========================================================================
  * Helpers
@@ -54,6 +65,542 @@
 static void die(const char *msg) {
     wlr_log(WLR_ERROR, "fatal: %s", msg);
     exit(1);
+}
+
+/* =========================================================================
+ * Color and border helpers
+ * ====================================================================== */
+
+/*
+ * color_to_float — convert packed 0xRRGGBBAA to float[4] in [0,1].
+ *
+ * wlr_scene_rect_create and wlr_scene_rect_set_color take float[4] in RGBA
+ * order with each component in [0,1]. Our compile-time color constants are
+ * packed 32-bit values; this converts them at call sites without magic numbers.
+ */
+static void color_to_float(uint32_t rgba, float out[4]) {
+    out[0] = ((rgba >> 24) & 0xFF) / 255.0f;  /* R */
+    out[1] = ((rgba >> 16) & 0xFF) / 255.0f;  /* G */
+    out[2] = ((rgba >>  8) & 0xFF) / 255.0f;  /* B */
+    out[3] = ((rgba      ) & 0xFF) / 255.0f;  /* A */
+}
+
+/*
+ * toplevel_set_border_color — set all 4 border rects to active or inactive.
+ *
+ * Called from focus_toplevel() when focus changes. Also called at map time
+ * to set the initial color before the first focus event fires.
+ */
+static void toplevel_set_border_color(struct Toplevel *tl, bool active) {
+    float color[4];
+    color_to_float(active ? BORDER_COLOR_ACTIVE : BORDER_COLOR_INACTIVE, color);
+    for (int i = 0; i < 4; i++)
+        wlr_scene_rect_set_color(tl->border[i], color);
+}
+
+/*
+ * toplevel_apply_geometry — push tl->state.geom into the scene graph.
+ *
+ * Updates scene tree position, surface offset, border rect sizes/positions,
+ * and sends an xdg configure with the new client content size.
+ *
+ * Must be called after writing tl->state.geom. The caller is responsible
+ * for writing the geometry; this function only applies it.
+ *
+ * Border layout (all positions relative to outer tree origin):
+ *   border[0] top:    (0,       0),       width × bw
+ *   border[1] bottom: (0,       h-bw),    width × bw
+ *   border[2] left:   (0,       bw),      bw × (h - 2*bw)
+ *   border[3] right:  (w-bw,    bw),      bw × (h - 2*bw)
+ */
+static void toplevel_apply_geometry(struct Toplevel *tl) {
+    int bw = tl->server->config.border_width;
+    struct wlr_box *g = &tl->state.geom;
+
+    /* Position the outer container in layout space. */
+    wlr_scene_node_set_position(&tl->scene_tree->node, g->x, g->y);
+
+    /* Offset the client surface inside the outer container. */
+    wlr_scene_node_set_position(&tl->surface_tree->node, bw, bw);
+
+    /* Resize and reposition the four border rects. */
+    int inner_h = g->height - 2 * bw;
+
+    wlr_scene_rect_set_size(tl->border[0], g->width, bw);           /* top */
+    wlr_scene_rect_set_size(tl->border[1], g->width, bw);           /* bottom */
+    wlr_scene_rect_set_size(tl->border[2], bw, inner_h);            /* left */
+    wlr_scene_rect_set_size(tl->border[3], bw, inner_h);            /* right */
+
+    /* Top is at (0,0) — no explicit set_position needed. */
+    wlr_scene_node_set_position(&tl->border[1]->node, 0, g->height - bw);
+    wlr_scene_node_set_position(&tl->border[2]->node, 0, bw);
+    wlr_scene_node_set_position(&tl->border[3]->node, g->width - bw, bw);
+
+    /* Tell the client its new content size. 0x0 means "client chooses" and
+     * is only used at initial_commit time; we never call this with (0,0) for
+     * a programmatic resize. */
+    int cw = g->width  - 2 * bw;
+    int ch = g->height - 2 * bw;
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
+    wlr_xdg_toplevel_set_size(tl->xdg_toplevel, (uint32_t)cw, (uint32_t)ch);
+}
+
+/* =========================================================================
+ * Focus and stacking helpers
+ * ====================================================================== */
+
+/*
+ * raise_toplevel — raise a window to the top of the stacking order.
+ *
+ * Separate from focus so that focus-follows-mouse does NOT raise (evilwm
+ * default). Raise happens on explicit click or via FUNC_RAISE bind.
+ *
+ * DECISION: evilwm does not raise on focus — windows can be obscured by
+ * others even when they have keyboard focus. This is deliberate. Users who
+ * want raise-on-focus can bind a key to FUNC_RAISE.
+ */
+static void raise_toplevel(struct Toplevel *tl) {
+    wlr_scene_node_raise_to_top(&tl->scene_tree->node);
+}
+
+/* =========================================================================
+ * Output and layout helpers
+ * ====================================================================== */
+
+/*
+ * toplevel_output_box — get the layout-space geometry of the output
+ * containing the center of tl's current geometry.
+ *
+ * Falls back to the first output in the server list if the center point
+ * doesn't land on any output (e.g. window is partially off-screen after
+ * an output hotplug). Returns a zero box if no outputs are connected.
+ */
+static struct wlr_box toplevel_output_box(struct Toplevel *tl) {
+    struct Server *server = tl->server;
+    struct wlr_box *g = &tl->state.geom;
+    double cx = g->x + g->width  / 2.0;
+    double cy = g->y + g->height / 2.0;
+
+    struct wlr_output *wlr_out =
+        wlr_output_layout_output_at(server->output_layout, cx, cy);
+
+    if (!wlr_out) {
+        /* Fall back to first output. */
+        if (!wl_list_empty(&server->outputs)) {
+            struct Output *out =
+                wl_container_of(server->outputs.next, out, link);
+            wlr_out = out->wlr_output;
+        } else {
+            return (struct wlr_box){0};
+        }
+    }
+
+    struct wlr_box box;
+    wlr_output_layout_get_box(server->output_layout, wlr_out, &box);
+    return box;
+}
+
+/*
+ * first_output_box — layout-space geometry of the first connected output.
+ *
+ * Used at map time before the window has a position (so we cannot use
+ * toplevel_output_box which requires a valid center point).
+ */
+static struct wlr_box first_output_box(struct Server *server) {
+    if (wl_list_empty(&server->outputs))
+        return (struct wlr_box){0};
+    struct Output *out = wl_container_of(server->outputs.next, out, link);
+    struct wlr_box box;
+    wlr_output_layout_get_box(server->output_layout, out->wlr_output, &box);
+    return box;
+}
+
+/*
+ * get_focused_toplevel — return the currently focused window, or NULL.
+ *
+ * server->toplevels is a wl_list where the front element (toplevels.next)
+ * is always the focused window (maintained by focus_toplevel and unmap).
+ */
+static struct Toplevel *get_focused_toplevel(struct Server *server) {
+    if (wl_list_empty(&server->toplevels))
+        return NULL;
+    struct Toplevel *tl;
+    tl = wl_container_of(server->toplevels.next, tl, link);
+    return tl;
+}
+
+/* =========================================================================
+ * Snap-to-edge
+ * ====================================================================== */
+
+/*
+ * apply_snap — snap window position to output or window edges.
+ *
+ * Modifies *x and *y in-place. Snap zone is config.snap_distance pixels.
+ * If snap_distance == 0, this is a no-op.
+ *
+ * Rules:
+ *   1. Snap window edge to output edge (all 4 combinations).
+ *   2. Snap window edge to edge of each other mapped window on the same
+ *      output (all 4 edge-to-edge combinations).
+ *
+ * Only windows on the same virtual desktop should be snapped against — for
+ * now all windows share desktop 0, so all visible windows are considered.
+ *
+ * SECURITY: snap_distance is range-clamped to [0,100] by config_load();
+ * the abs() calls prevent negative distances from skewing the threshold.
+ */
+static void apply_snap(struct Server *server, struct Toplevel *tl,
+        int *x, int *y, const struct wlr_box *out) {
+    int snap = server->config.snap_distance;
+    if (snap == 0)
+        return;
+
+    int w = tl->state.geom.width;
+    int h = tl->state.geom.height;
+
+    /* Snap to output edges. */
+    if (abs(*x - out->x) < snap)                         *x = out->x;
+    if (abs(*x + w - (out->x + out->width))  < snap)     *x = out->x + out->width - w;
+    if (abs(*y - out->y) < snap)                         *y = out->y;
+    if (abs(*y + h - (out->y + out->height)) < snap)     *y = out->y + out->height - h;
+
+    /* Snap to edges of other mapped windows. */
+    struct Toplevel *other;
+    wl_list_for_each(other, &server->toplevels, link) {
+        if (other == tl)
+            continue;
+        struct wlr_box *og = &other->state.geom;
+
+        /* Left edge of tl near right edge of other. */
+        if (abs(*x - (og->x + og->width)) < snap)         *x = og->x + og->width;
+        /* Right edge of tl near left edge of other. */
+        if (abs(*x + w - og->x) < snap)                   *x = og->x - w;
+        /* Top edge of tl near bottom edge of other. */
+        if (abs(*y - (og->y + og->height)) < snap)        *y = og->y + og->height;
+        /* Bottom edge of tl near top edge of other. */
+        if (abs(*y + h - og->y) < snap)                   *y = og->y - h;
+    }
+}
+
+/* =========================================================================
+ * Mouse grab — move and resize
+ * ====================================================================== */
+
+/*
+ * begin_move_grab — start a Super+button1 interactive move.
+ *
+ * Records the cursor's offset from the window origin at grab start so that
+ * the window follows the cursor without jumping to place the origin under
+ * the pointer.
+ *
+ * SECURITY: wlr_seat_pointer_clear_focus() ensures no client surface has
+ * pointer focus during the grab. Combined with early-return in
+ * process_cursor_motion(), clients receive neither enter nor motion events
+ * while the grab is active.
+ */
+static void begin_move_grab(struct Server *server) {
+    double sx, sy;
+    struct Toplevel *tl = NULL;
+    /* toplevel_at with NULL surface_out — we only need the toplevel. */
+    tl = toplevel_at(server, server->cursor->x, server->cursor->y,
+        NULL, &sx, &sy);
+    if (!tl)
+        return;
+
+    server->cursor_mode  = CurMove;
+    server->grab_tl      = tl;
+    server->grab_geom    = tl->state.geom;
+    /* Offset so window origin tracks cursor, not teleports to it. */
+    server->grab_anchor_x = (int)round(server->cursor->x) - tl->state.geom.x;
+    server->grab_anchor_y = (int)round(server->cursor->y) - tl->state.geom.y;
+
+    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "fleur");
+
+    /* SECURITY: clear pointer focus — no client receives pointer events
+     * while this grab is active. */
+    wlr_seat_pointer_clear_focus(server->seat);
+}
+
+/*
+ * begin_resize_grab — start a Super+button2 interactive resize.
+ *
+ * Determines which corner of the window is nearest to the cursor. The
+ * OPPOSITE corner becomes the anchor — it stays fixed during the drag.
+ * The drag corner tracks the cursor.
+ *
+ * DECISION: nearest-corner anchor rather than fixed bottom-right. This
+ * matches evilwm's model and is more ergonomic for windows in the top-right
+ * quadrant of the screen (you'd be dragging away from the corner otherwise).
+ *
+ * SECURITY: same as begin_move_grab — pointer focus is cleared.
+ */
+static void begin_resize_grab(struct Server *server) {
+    double sx, sy;
+    struct Toplevel *tl = NULL;
+    tl = toplevel_at(server, server->cursor->x, server->cursor->y,
+        NULL, &sx, &sy);
+    if (!tl)
+        return;
+
+    server->cursor_mode = CurResize;
+    server->grab_tl     = tl;
+    server->grab_geom   = tl->state.geom;
+
+    /* Determine which corner is nearest the cursor. */
+    double cx = server->cursor->x;
+    double cy = server->cursor->y;
+    struct wlr_box *g = &tl->state.geom;
+    double mid_x = g->x + g->width  / 2.0;
+    double mid_y = g->y + g->height / 2.0;
+
+    /* Anchor = opposite corner from the one nearest the cursor. */
+    server->grab_anchor_x = (cx < mid_x) ? (g->x + g->width)  : g->x;
+    server->grab_anchor_y = (cy < mid_y) ? (g->y + g->height) : g->y;
+
+    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "se-resize");
+
+    /* SECURITY: clear pointer focus during grab. */
+    wlr_seat_pointer_clear_focus(server->seat);
+}
+
+/*
+ * end_grab — release the active mouse grab.
+ *
+ * Called on button release in handle_cursor_button(). Resets cursor to
+ * default; pointer focus will be restored by the next process_cursor_motion
+ * call now that cursor_mode == CurNormal.
+ */
+static void end_grab(struct Server *server) {
+    server->cursor_mode = CurNormal;
+    server->grab_tl     = NULL;
+    wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+}
+
+/*
+ * handle_move_grab — update window position during an active move grab.
+ *
+ * Called from process_cursor_motion() when cursor_mode == CurMove.
+ *
+ * SECURITY: this function does NOT forward pointer events to clients.
+ * It returns without calling wlr_seat_pointer_notify_*. The caller must
+ * return immediately after this call — verified by structure in
+ * process_cursor_motion().
+ */
+static void handle_move_grab(struct Server *server) {
+    struct Toplevel *tl = server->grab_tl;
+    if (!tl)
+        return;
+
+    int new_x = (int)round(server->cursor->x) - server->grab_anchor_x;
+    int new_y = (int)round(server->cursor->y) - server->grab_anchor_y;
+
+    struct wlr_box out = toplevel_output_box(tl);
+    apply_snap(server, tl, &new_x, &new_y, &out);
+
+    tl->state.geom.x = new_x;
+    tl->state.geom.y = new_y;
+    /* Width/height unchanged — only move the outer tree. */
+    wlr_scene_node_set_position(&tl->scene_tree->node, new_x, new_y);
+}
+
+/*
+ * handle_resize_grab — update window size during an active resize grab.
+ *
+ * Called from process_cursor_motion() when cursor_mode == CurResize.
+ *
+ * The drag corner tracks the cursor; the anchor corner is fixed. Size is
+ * clamped so client content stays >= MIN_WIN_CONTENT in each dimension.
+ *
+ * SECURITY: does not forward pointer events to clients. See handle_move_grab.
+ */
+static void handle_resize_grab(struct Server *server) {
+    struct Toplevel *tl = server->grab_tl;
+    if (!tl)
+        return;
+
+    int bw  = server->config.border_width;
+    int min = MIN_WIN_CONTENT + 2 * bw;
+    int ax  = server->grab_anchor_x;
+    int ay  = server->grab_anchor_y;
+    int cx  = (int)round(server->cursor->x);
+    int cy  = (int)round(server->cursor->y);
+
+    int new_w = abs(cx - ax);
+    int new_h = abs(cy - ay);
+    if (new_w < min) new_w = min;
+    if (new_h < min) new_h = min;
+
+    /* Keep anchor corner fixed; drag corner follows cursor (clamped). */
+    int new_x = (ax < cx) ? ax : ax - new_w;
+    int new_y = (ay < cy) ? ay : ay - new_h;
+
+    tl->state.geom = (struct wlr_box){new_x, new_y, new_w, new_h};
+    toplevel_apply_geometry(tl);
+}
+
+/* =========================================================================
+ * Keyboard move and resize
+ * ====================================================================== */
+
+/*
+ * do_keyboard_move — execute a FUNC_MOVE bind with the given flags.
+ *
+ * FLAG_RELATIVE + direction: move by MOVE_STEP pixels, clamped to keep at
+ * least MOVE_STEP pixels of the window visible on the output.
+ *
+ * Corner flags (top/bottom + left/right): snap the window to the
+ * corresponding corner of the current output, flush to the edge.
+ */
+static void do_keyboard_move(struct Server *server, uint32_t flags) {
+    struct Toplevel *tl = get_focused_toplevel(server);
+    if (!tl)
+        return;
+
+    struct wlr_box out = toplevel_output_box(tl);
+    int x = tl->state.geom.x;
+    int y = tl->state.geom.y;
+    int w = tl->state.geom.width;
+    int h = tl->state.geom.height;
+
+    if (flags & FLAG_RELATIVE) {
+        /* Incremental move by MOVE_STEP in the flagged direction(s). */
+        if (flags & FLAG_LEFT)  x -= MOVE_STEP;
+        if (flags & FLAG_RIGHT) x += MOVE_STEP;
+        if (flags & FLAG_UP)    y -= MOVE_STEP;
+        if (flags & FLAG_DOWN)  y += MOVE_STEP;
+
+        /* Clamp: keep at least MOVE_STEP px of the window visible.
+         * This prevents keyboard-moving a window fully off-screen. */
+        int x_min = out.x + MOVE_STEP - w;
+        int x_max = out.x + out.width  - MOVE_STEP;
+        int y_min = out.y + MOVE_STEP - h;
+        int y_max = out.y + out.height - MOVE_STEP;
+        if (x < x_min) x = x_min;
+        if (x > x_max) x = x_max;
+        if (y < y_min) y = y_min;
+        if (y > y_max) y = y_max;
+
+    } else {
+        /* Corner move: position flush to the specified corner. */
+        bool top    = (flags & FLAG_TOP)    != 0;
+        bool bottom = (flags & FLAG_BOTTOM) != 0;
+        bool left   = (flags & FLAG_LEFT)   != 0;
+        bool right  = (flags & FLAG_RIGHT)  != 0;
+
+        if (top)    y = out.y;
+        if (bottom) y = out.y + out.height - h;
+        if (left)   x = out.x;
+        if (right)  x = out.x + out.width  - w;
+    }
+
+    apply_snap(server, tl, &x, &y, &out);
+    tl->state.geom.x = x;
+    tl->state.geom.y = y;
+    /* Move only — no size change. Update scene node position directly to
+     * avoid the configure roundtrip that toplevel_apply_geometry would
+     * trigger with an unchanged size. */
+    wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+}
+
+/*
+ * do_keyboard_resize — execute a FUNC_RESIZE bind with the given flags.
+ *
+ * FLAG_RELATIVE + direction: grow/shrink by MOVE_STEP, clamped at
+ * MIN_WIN_CONTENT client content pixels.
+ *
+ * FLAG_TOGGLE + axis flags: toggle maximization on the specified axis.
+ * Restore uses saved_geom (saved on first maximize transition only).
+ */
+static void do_keyboard_resize(struct Server *server, uint32_t flags) {
+    struct Toplevel *tl = get_focused_toplevel(server);
+    if (!tl)
+        return;
+
+    struct wlr_box out = toplevel_output_box(tl);
+    int bw  = server->config.border_width;
+    int min = MIN_WIN_CONTENT + 2 * bw;
+
+    int x = tl->state.geom.x;
+    int y = tl->state.geom.y;
+    int w = tl->state.geom.width;
+    int h = tl->state.geom.height;
+
+    if (flags & FLAG_RELATIVE) {
+        /* Incremental resize — up/left shrink, down/right grow. */
+        if (flags & FLAG_LEFT)  w -= MOVE_STEP;
+        if (flags & FLAG_RIGHT) w += MOVE_STEP;
+        if (flags & FLAG_UP)    h -= MOVE_STEP;
+        if (flags & FLAG_DOWN)  h += MOVE_STEP;
+        if (w < min) w = min;
+        if (h < min) h = min;
+
+    } else if (flags & FLAG_TOGGLE) {
+        bool do_v = (flags & FLAG_VERTICAL)   != 0;
+        bool do_h = (flags & FLAG_HORIZONTAL) != 0;
+
+        /*
+         * Toggle+v+h: if any axis is already maximized, restore fully.
+         * Otherwise maximize both axes simultaneously.
+         *
+         * Toggle+v or toggle+h individually: toggle the respective axis.
+         * The saved_geom is written only on the FIRST maximize transition
+         * (from no-maximize). Second-axis toggles share the same save so
+         * full restore returns to the original pre-maximize geometry.
+         */
+        if (do_v && do_h) {
+            if (tl->state.max_flags) {
+                /* Restore. */
+                x = tl->state.saved_geom.x;
+                y = tl->state.saved_geom.y;
+                w = tl->state.saved_geom.width;
+                h = tl->state.saved_geom.height;
+                tl->state.max_flags = 0;
+            } else {
+                /* Save and maximize fully. */
+                tl->state.saved_geom = tl->state.geom;
+                x = out.x; y = out.y;
+                w = out.width; h = out.height;
+                tl->state.max_flags = FLAG_VERTICAL | FLAG_HORIZONTAL;
+            }
+
+        } else if (do_v) {
+            if (tl->state.max_flags & FLAG_VERTICAL) {
+                /* Restore vertical axis. */
+                y = tl->state.saved_geom.y;
+                h = tl->state.saved_geom.height;
+                tl->state.max_flags &= ~FLAG_VERTICAL;
+            } else {
+                /* Save only if transitioning from fully unmaximized. */
+                if (!tl->state.max_flags)
+                    tl->state.saved_geom = tl->state.geom;
+                y = out.y;
+                h = out.height;
+                tl->state.max_flags |= FLAG_VERTICAL;
+            }
+
+        } else if (do_h) {
+            if (tl->state.max_flags & FLAG_HORIZONTAL) {
+                /* Restore horizontal axis. */
+                x = tl->state.saved_geom.x;
+                w = tl->state.saved_geom.width;
+                tl->state.max_flags &= ~FLAG_HORIZONTAL;
+            } else {
+                if (!tl->state.max_flags)
+                    tl->state.saved_geom = tl->state.geom;
+                x = out.x;
+                w = out.width;
+                tl->state.max_flags |= FLAG_HORIZONTAL;
+            }
+        }
+
+        if (w < min) w = min;
+        if (h < min) h = min;
+    }
+
+    tl->state.geom = (struct wlr_box){x, y, w, h};
+    toplevel_apply_geometry(tl);
 }
 
 /*
@@ -73,19 +620,28 @@ static struct Toplevel *toplevel_at(struct Server *server,
         struct wlr_surface **surface_out, double *sx, double *sy) {
     struct wlr_scene_node *node =
         wlr_scene_node_at(&server->scene->tree.node, lx, ly, sx, sy);
-    if (!node || node->type != WLR_SCENE_NODE_BUFFER)
+    if (!node)
         return NULL;
 
-    struct wlr_scene_buffer *scene_buf = wlr_scene_buffer_from_node(node);
-    struct wlr_scene_surface *scene_surface =
-        wlr_scene_surface_try_from_buffer(scene_buf);
-    if (!scene_surface)
-        return NULL;
+    /*
+     * A buffer node may be a client surface — extract the wlr_surface.
+     * A rect node is a border rectangle; there is no surface to forward
+     * pointer events to, so surface_out is left NULL for rect hits.
+     * The Toplevel is still returned (for raise/focus on border clicks).
+     */
+    if (node->type == WLR_SCENE_NODE_BUFFER) {
+        struct wlr_scene_buffer *scene_buf = wlr_scene_buffer_from_node(node);
+        struct wlr_scene_surface *scene_surface =
+            wlr_scene_surface_try_from_buffer(scene_buf);
+        if (scene_surface && surface_out)
+            *surface_out = scene_surface->surface;
+        /* If it is a non-surface buffer (e.g. scene background), no surface_out. */
+    }
+    /* For WLR_SCENE_NODE_RECT (border), surface_out stays NULL — no forwarding. */
 
-    if (surface_out)
-        *surface_out = scene_surface->surface;
-
-    /* Walk up the scene tree to find the node tagged with a Toplevel pointer. */
+    /* Walk up through tree nodes to find the one tagged with a Toplevel pointer.
+     * scene_tree->node.data is set to the owning Toplevel in
+     * handle_new_xdg_toplevel(). */
     struct wlr_scene_tree *tree = node->parent;
     while (tree && tree != &server->scene->tree) {
         struct Toplevel *tl = tree->node.data;
@@ -99,11 +655,19 @@ static struct Toplevel *toplevel_at(struct Server *server,
 /*
  * focus_toplevel() — give keyboard focus to a toplevel window.
  *
- * Raises the window to the top of the stacking order, moves it to the front
- * of the focus list, deactivates the previously focused toplevel, and sends
- * wl_keyboard.enter to the new surface.
+ * Moves the window to the front of the focus list, updates border colors,
+ * deactivates the previously focused toplevel, and sends wl_keyboard.enter.
  *
- * Passing NULL is safe and clears focus.
+ * Does NOT raise the window. evilwm's focus model: focus follows the pointer
+ * but windows are not raised on focus. Raise happens on click (handled in
+ * handle_cursor_button) or via an explicit FUNC_RAISE bind.
+ *
+ * DECISION: not raising on focus is intentional — it is the evilwm default.
+ * Raise-on-focus would interfere with workflows where the user wants to read
+ * a background window while typing in a foreground one. If raise-on-focus is
+ * desired later, it should be a config option, not the default.
+ *
+ * Passing NULL is safe and clears keyboard focus without changing borders.
  */
 static void focus_toplevel(struct Toplevel *tl) {
     if (!tl)
@@ -115,29 +679,40 @@ static void focus_toplevel(struct Toplevel *tl) {
     struct wlr_surface *prev = seat->keyboard_state.focused_surface;
 
     if (prev == surface)
-        return; /* already focused */
+        return; /* already focused — no border update needed */
 
     if (prev) {
-        /* Deactivate the previously focused toplevel so the client repaints
-         * (e.g. stops drawing its caret). */
-        struct wlr_xdg_toplevel *prev_tl =
+        /* Deactivate the previously focused toplevel so it repaints
+         * its titlebar / caret in the inactive state. */
+        struct wlr_xdg_toplevel *prev_xdg =
             wlr_xdg_toplevel_try_from_wlr_surface(prev);
-        if (prev_tl)
-            wlr_xdg_toplevel_set_activated(prev_tl, false);
-    }
+        if (prev_xdg) {
+            wlr_xdg_toplevel_set_activated(prev_xdg, false);
 
-    /* Raise to top of stacking order within LyrFloat. */
-    wlr_scene_node_raise_to_top(&tl->scene_tree->node);
+            /* Color the old window's border inactive.
+             * We find the Toplevel via: xdg_surface->data = surface_tree,
+             * surface_tree->node.parent = scene_tree (outer container),
+             * scene_tree->node.data = Toplevel. */
+            struct wlr_scene_tree *surf_tree = prev_xdg->base->data;
+            if (surf_tree) {
+                struct wlr_scene_tree *outer = surf_tree->node.parent;
+                if (outer) {
+                    struct Toplevel *prev_tl = outer->node.data;
+                    if (prev_tl)
+                        toplevel_set_border_color(prev_tl, false);
+                }
+            }
+        }
+    }
 
     /* Move to front of focus list (front = focused). */
     wl_list_remove(&tl->link);
     wl_list_insert(&server->toplevels, &tl->link);
 
     wlr_xdg_toplevel_set_activated(tl->xdg_toplevel, true);
+    toplevel_set_border_color(tl, true);
 
-    /* Forward current keyboard state to the new surface. Using
-     * wlr_seat_get_keyboard() picks whichever keyboard was last set on the
-     * seat, which is updated each time a key event is processed. */
+    /* Forward current keyboard state to the new surface. */
     struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
     if (kb) {
         wlr_seat_keyboard_notify_enter(seat, surface,
@@ -146,32 +721,66 @@ static void focus_toplevel(struct Toplevel *tl) {
 }
 
 /*
- * process_cursor_motion() — update pointer focus after the cursor has moved.
+ * process_cursor_motion() — update pointer focus and grab state after cursor moves.
  *
- * Finds the surface under the cursor and forwards motion to it. If no surface
- * is under the cursor, resets to the default xcursor image and clears pointer
- * focus.
+ * Three cases:
  *
- * Focus-follows-pointer: pointer focus updates continuously as the cursor
- * moves. Keyboard focus still requires a click (see handle_cursor_button).
- * The evilwm behavior layer (later phase) will switch keyboard focus to
- * follow the pointer as well.
+ * 1. Active grab (CurMove or CurResize): compositor consumes the event and
+ *    updates the grabbed window. No pointer events reach any client.
+ *    SECURITY: this is the enforcement point for the grab security property.
+ *    Early-return prevents any wlr_seat_pointer_notify_* call.
+ *
+ * 2. Cursor over a client surface: focus-follows-mouse (no raise), forward
+ *    pointer motion to the surface.
+ *
+ * 3. Cursor over a border rect or background: clear client pointer focus,
+ *    reset cursor image. Keyboard focus is retained (evilwm: "focus is not
+ *    lost if you stray onto the root window").
  */
 static void process_cursor_motion(struct Server *server, uint32_t time_msec) {
+    /*
+     * SECURITY: during an active grab all pointer motion is consumed by the
+     * compositor. No enter/motion events are sent to any client surface.
+     * handle_cursor_button() enforces the same property for button events.
+     */
+    if (server->cursor_mode == CurMove) {
+        handle_move_grab(server);
+        return;
+    }
+    if (server->cursor_mode == CurResize) {
+        handle_resize_grab(server);
+        return;
+    }
+
     double sx, sy;
     struct wlr_surface *surface = NULL;
     struct Toplevel *tl = toplevel_at(server,
         server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 
     if (!tl) {
-        /* Cursor is not over any surface. */
+        /* Cursor is over the background — retain keyboard focus (evilwm
+         * behavior: focus does not move when pointer leaves all windows). */
         wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
         wlr_seat_pointer_clear_focus(server->seat);
         return;
     }
 
-    wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-    wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
+    /*
+     * Focus-follows-mouse: give keyboard focus to the window under the
+     * cursor. Does NOT raise — see focus_toplevel() and raise_toplevel().
+     */
+    focus_toplevel(tl);
+
+    if (surface) {
+        /* Cursor is over the client surface — forward pointer events. */
+        wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+        wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
+    } else {
+        /* Cursor is over a border rect — no surface to forward events to.
+         * Clear client pointer focus so no stray enter event lingers. */
+        wlr_seat_pointer_clear_focus(server->seat);
+        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+    }
 }
 
 /* =========================================================================
@@ -212,55 +821,144 @@ static void spawn_terminal(const char *term) {
 /*
  * dispatch_bind — execute the action described by *bind.
  *
- * Called from both keyboard and mouse event handlers after a bind has been
- * matched. Currently only FUNC_SPAWN is implemented (spawns the configured
- * terminal). All other functions are stubs logged at WLR_DEBUG level — they
- * will be filled in during the evilwm behavior layer phase.
+ * Called from keyboard and mouse event handlers after a bind has been matched.
+ * For mouse binds (bind->is_mouse), FUNC_MOVE and FUNC_RESIZE start an
+ * interactive grab; for keyboard binds, they perform discrete moves/resizes
+ * driven by bind->flags.
  *
  * SECURITY: No system() or popen() here or in any called function. The only
  * exec path is spawn_terminal() which goes fork+execvp directly.
  */
 static void dispatch_bind(struct Server *server, const EwBind *bind) {
     switch (bind->function) {
+
     case FUNC_SPAWN:
         spawn_terminal(server->config.terminal);
         break;
 
-    case FUNC_DELETE:
-        wlr_log(WLR_DEBUG, "bind: delete — not yet implemented (Phase 2)");
+    case FUNC_DELETE: {
+        /*
+         * Cooperative close — sends xdg_toplevel.close to the focused client.
+         * The client may ignore it or prompt the user before exiting.
+         * Use FUNC_KILL for unresponsive windows.
+         */
+        struct Toplevel *tl = get_focused_toplevel(server);
+        if (tl)
+            wlr_xdg_toplevel_send_close(tl->xdg_toplevel);
         break;
-    case FUNC_KILL:
-        wlr_log(WLR_DEBUG, "bind: kill — not yet implemented (Phase 2)");
+    }
+
+    case FUNC_KILL: {
+        /*
+         * Forceful termination — destroys the Wayland client connection.
+         * The client's process gets SIGPIPE or similar from libwayland; it
+         * will typically exit. Use only for stuck/unresponsive clients.
+         *
+         * SECURITY: wl_client_destroy() is the correct API for this. It is
+         * not a signal sent to the process — it closes the socket, which
+         * lets the kernel clean up the process gracefully if it handles
+         * disconnect. An actual SIGKILL on the PID is not provided here;
+         * future enhancement could add that via wl_client_get_credentials().
+         */
+        struct Toplevel *tl = get_focused_toplevel(server);
+        if (tl) {
+            struct wl_client *client =
+                wl_resource_get_client(tl->xdg_toplevel->base->resource);
+            wl_client_destroy(client);
+        }
         break;
-    case FUNC_LOWER:
-        wlr_log(WLR_DEBUG, "bind: lower — not yet implemented (Phase 2)");
+    }
+
+    case FUNC_LOWER: {
+        /* Lower the focused window to the bottom of the stacking order. */
+        struct Toplevel *tl = get_focused_toplevel(server);
+        if (tl)
+            wlr_scene_node_lower_to_bottom(&tl->scene_tree->node);
         break;
-    case FUNC_RAISE:
-        wlr_log(WLR_DEBUG, "bind: raise — not yet implemented (Phase 2)");
+    }
+
+    case FUNC_RAISE: {
+        /* Raise the focused window to the top of the stacking order. */
+        struct Toplevel *tl = get_focused_toplevel(server);
+        if (tl)
+            raise_toplevel(tl);
         break;
+    }
+
     case FUNC_MOVE:
-        wlr_log(WLR_DEBUG, "bind: move flags=0x%x — not yet implemented (Phase 2)",
-            bind->flags);
+        /*
+         * Mouse bind: begin interactive move grab (Super+drag).
+         * Keyboard bind: discrete move by flags (relative or corner).
+         *
+         * DECISION: the is_mouse field on the bind distinguishes the two
+         * paths. This keeps the dispatch table clean without separate
+         * functions for mouse vs keyboard variants of the same logical action.
+         */
+        if (bind->is_mouse)
+            begin_move_grab(server);
+        else
+            do_keyboard_move(server, bind->flags);
         break;
+
     case FUNC_RESIZE:
-        wlr_log(WLR_DEBUG, "bind: resize flags=0x%x — not yet implemented (Phase 2)",
-            bind->flags);
+        /* Same split as FUNC_MOVE: mouse starts grab, keyboard does step/toggle. */
+        if (bind->is_mouse)
+            begin_resize_grab(server);
+        else
+            do_keyboard_resize(server, bind->flags);
         break;
-    case FUNC_FIX:
-        wlr_log(WLR_DEBUG, "bind: fix — not yet implemented (Phase 2)");
+
+    case FUNC_FIX: {
+        /*
+         * Toggle the fixed (sticky) flag on the focused window.
+         * Fixed windows will remain visible across all virtual desktops when
+         * FUNC_VDESK is implemented. The flag is stored and preserved now;
+         * it has no visible effect until virtual desktop switching is added.
+         */
+        struct Toplevel *tl = get_focused_toplevel(server);
+        if (tl) {
+            tl->state.fixed = !tl->state.fixed;
+            wlr_log(WLR_DEBUG, "bind: fix: window is now %s",
+                tl->state.fixed ? "fixed" : "unfixed");
+        }
         break;
+    }
+
+    case FUNC_NEXT: {
+        /*
+         * Cycle focus to the next window in the toplevels list.
+         * server->toplevels is front=focused; next-after-front is the
+         * "other window" to cycle to.
+         *
+         * DECISION: cycles to the second item only (no full rotation through
+         * all windows on each press). Full Alt+Tab style cycling is a later
+         * enhancement; for two-window workflows this is sufficient and matches
+         * evilwm's minimal approach.
+         */
+        if (!wl_list_empty(&server->toplevels) &&
+                server->toplevels.next->next != &server->toplevels) {
+            struct Toplevel *next;
+            next = wl_container_of(server->toplevels.next->next, next, link);
+            focus_toplevel(next);
+        }
+        break;
+    }
+
     case FUNC_VDESK:
-        wlr_log(WLR_DEBUG, "bind: vdesk target=%d flags=0x%x — not yet implemented (Phase 2)",
-            bind->vdesk_target, bind->flags);
+        /* Virtual desktops not yet implemented. Window state (vdesk field)
+         * is already stored per-window; the switching logic comes in a later
+         * phase. */
+        fprintf(stderr, "evilway: vdesk not yet implemented\n");
         break;
-    case FUNC_NEXT:
-        wlr_log(WLR_DEBUG, "bind: next — not yet implemented (Phase 2)");
-        break;
+
     case FUNC_DOCK:
-        wlr_log(WLR_DEBUG, "bind: dock — not yet implemented (Phase 2)");
+        /* Dock toggle not yet implemented. */
+        fprintf(stderr, "evilway: dock not yet implemented\n");
         break;
+
     case FUNC_INFO:
-        wlr_log(WLR_DEBUG, "bind: info — not yet implemented (Phase 2)");
+        /* Window info overlay not yet implemented. */
+        fprintf(stderr, "evilway: info not yet implemented\n");
         break;
     }
 }
@@ -476,24 +1174,96 @@ static void handle_cursor_button(struct wl_listener *listener, void *data) {
     struct Server *server = wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
 
-    /* Forward the raw button event to the focused client. */
-    wlr_seat_pointer_notify_button(server->seat,
-        event->time_msec, event->button, event->state);
+    /*
+     * SECURITY: compositor grabs are checked BEFORE forwarding to clients.
+     * The original scaffold called wlr_seat_pointer_notify_button() first,
+     * which would forward events to clients even during a grab. This is
+     * incorrect — the forwarding call is moved to the bottom and only reached
+     * when the event is not consumed by the compositor.
+     */
+
+    if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+        if (server->cursor_mode != CurNormal) {
+            /*
+             * SECURITY: grab is ending — do not forward this button release
+             * to any client. end_grab() resets cursor_mode and cursor image.
+             * The next process_cursor_motion() call will restore pointer focus.
+             */
+            end_grab(server);
+            return;
+        }
+        /* Non-grab release: fall through to notify client below. */
+    }
 
     if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        /* Click-to-focus: give keyboard focus to whatever is under the cursor.
-         * In the evilwm behavior phase this becomes focus-follows-pointer, but
-         * click-to-focus is correct for the scaffold. */
+        /*
+         * Check for Super+mouse compositor binds first.
+         *
+         * Super (WLR_MODIFIER_LOGO) gates all mouse window-management actions.
+         * Mouse binds in .evilwayrc do not require a modifier syntax because
+         * Super is always implied — it is the compositor modifier for all
+         * pointer-driven WM actions. This matches evilwm's Alt+drag model.
+         *
+         * When Super is held: look up a configured mouse bind first; if none
+         * matches for this button, use the built-in defaults:
+         *   button1 → move, button2 → resize, button3 → lower.
+         *
+         * SECURITY: on Super+mouse, return WITHOUT calling notify_button.
+         * The client does not learn about these button presses.
+         */
+        struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
+        uint32_t mods = kb ? wlr_keyboard_get_modifiers(kb) : 0;
+
+        if (mods & WLR_MODIFIER_LOGO) {
+            /* Try user-configured mouse binds first. */
+            bool handled = false;
+            for (size_t i = 0; i < server->config.num_binds; i++) {
+                const EwBind *b = &server->config.binds[i];
+                if (b->is_mouse &&
+                        b->button >= 1 && b->button <= 5 &&
+                        button_evdev[b->button] == event->button) {
+                    dispatch_bind(server, b);
+                    handled = true;
+                    break;
+                }
+            }
+
+            if (!handled) {
+                /* Built-in defaults (evilwm mouse model):
+                 *   Super+button1 drag  → move window
+                 *   Super+button2 drag  → resize window (nearest-corner)
+                 *   Super+button3 click → lower window  */
+                if (event->button == BTN_LEFT) {
+                    static const EwBind move_bind = {
+                        .is_mouse = true, .function = FUNC_MOVE };
+                    dispatch_bind(server, &move_bind);
+                } else if (event->button == BTN_MIDDLE) {
+                    static const EwBind resize_bind = {
+                        .is_mouse = true, .function = FUNC_RESIZE };
+                    dispatch_bind(server, &resize_bind);
+                } else if (event->button == BTN_RIGHT) {
+                    static const EwBind lower_bind = {
+                        .is_mouse = true, .function = FUNC_LOWER };
+                    dispatch_bind(server, &lower_bind);
+                }
+            }
+            /* SECURITY: consumed by compositor — do NOT forward to client. */
+            return;
+        }
+
+        /* No Super modifier: normal click.
+         * Raise the window under the cursor and give it keyboard focus.
+         * Raise-on-click is the standard floating-WM stacking behavior. */
         double sx, sy;
         struct wlr_surface *surface = NULL;
         struct Toplevel *tl = toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-        focus_toplevel(tl);
+        if (tl) {
+            raise_toplevel(tl);
+            focus_toplevel(tl);
+        }
 
-        /* Check user-configured mouse binds.
-         * Mouse binds do not filter on keyboard modifier state in this phase.
-         * The evilwm behavior layer (Super+drag, Super+RMB drag) will add
-         * modifier-aware mouse handling when move/resize are implemented. */
+        /* Non-Super mouse binds (e.g. "bind button1=spawn"). */
         for (size_t i = 0; i < server->config.num_binds; i++) {
             const EwBind *b = &server->config.binds[i];
             if (b->is_mouse &&
@@ -503,6 +1273,11 @@ static void handle_cursor_button(struct wl_listener *listener, void *data) {
             }
         }
     }
+
+    /* Forward to the client that has pointer focus.
+     * Reached only when the event was NOT consumed by a compositor bind. */
+    wlr_seat_pointer_notify_button(server->seat,
+        event->time_msec, event->button, event->state);
 }
 
 static void handle_cursor_axis(struct wl_listener *listener, void *data) {
@@ -758,16 +1533,60 @@ static void handle_new_xdg_popup(struct wl_listener *listener, void *data) {
 
 static void handle_toplevel_map(struct wl_listener *listener, void *data) {
     (void)data;
-    /* Called when the surface is ready to display (first buffer committed
-     * after a successful configure roundtrip). */
+    /*
+     * Called when the surface is ready to display (first buffer committed
+     * after the initial configure roundtrip). At this point the client has
+     * chosen its size and we can read it back to set our initial geometry.
+     *
+     * Initial geometry: window is centered on the first output at its
+     * natural size plus borders. If the client didn't set an explicit xdg
+     * window geometry we fall back to the committed surface dimensions.
+     */
     struct Toplevel *tl = wl_container_of(listener, tl, map);
-    wl_list_insert(&tl->server->toplevels, &tl->link);
+    struct Server *server = tl->server;
+    int bw = server->config.border_width;
+
+    /* Read the client's natural content size. */
+    struct wlr_box xdg_geom = tl->xdg_toplevel->base->current.geometry;
+    int sw = (xdg_geom.width  > 0) ? xdg_geom.width
+                                    : tl->xdg_toplevel->base->surface->current.width;
+    int sh = (xdg_geom.height > 0) ? xdg_geom.height
+                                    : tl->xdg_toplevel->base->surface->current.height;
+    /* Fallback if surface hasn't committed a real buffer yet. */
+    if (sw <= 0) sw = 640;
+    if (sh <= 0) sh = 480;
+
+    int w = sw + 2 * bw;
+    int h = sh + 2 * bw;
+
+    /* Center on the first output. */
+    struct wlr_box out = first_output_box(server);
+    int x = out.x + (out.width  - w) / 2;
+    int y = out.y + (out.height - h) / 2;
+    if (x < out.x) x = out.x;
+    if (y < out.y) y = out.y;
+
+    tl->state.geom = (struct wlr_box){x, y, w, h};
+
+    /* Ensure outer tree is visible (it starts enabled; re-enable after unmap). */
+    wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
+    toplevel_apply_geometry(tl);
+
+    wl_list_insert(&server->toplevels, &tl->link);
     focus_toplevel(tl);
+    wlr_log(WLR_DEBUG, "mapped toplevel: '%s' at (%d,%d) %dx%d",
+        tl->xdg_toplevel->title ? tl->xdg_toplevel->title : "(no title)",
+        x, y, w, h);
 }
 
 static void handle_toplevel_unmap(struct wl_listener *listener, void *data) {
     (void)data;
     struct Toplevel *tl = wl_container_of(listener, tl, unmap);
+
+    /* Hide the outer container tree so border rects disappear with the window.
+     * wlroots auto-hides the surface_tree (xdg subtree) but does NOT hide our
+     * manually-created outer scene_tree or its border rect children. */
+    wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
 
     /* If this was the focused window, focus the next one in the list. */
     struct wlr_seat *seat = tl->server->seat;
@@ -835,25 +1654,50 @@ static void handle_toplevel_destroy(struct wl_listener *listener, void *data) {
      * either way. */
     wl_list_remove(&tl->link);
 
+    /*
+     * Destroy the outer container scene tree and all its children:
+     * border[0..3] rects and surface_tree (the xdg surface subtree).
+     *
+     * IMPORTANT: we created scene_tree with wlr_scene_tree_create() (not
+     * via any xdg auto-management), so we must destroy it explicitly.
+     * wlr_scene_node_destroy() tears down the subtree and removes all
+     * child nodes; this is safe to call here per dwl's destroynotify().
+     *
+     * wlroots manages surface_tree's internal wl_listeners; they are
+     * cleaned up when the node is destroyed, preventing double-free.
+     */
+    if (tl->scene_tree)
+        wlr_scene_node_destroy(&tl->scene_tree->node);
+
+    /* Clear grab reference if this window was being grabbed. */
+    if (tl->server->grab_tl == tl) {
+        tl->server->cursor_mode = CurNormal;
+        tl->server->grab_tl = NULL;
+    }
+
     free(tl);
 }
 
-/* Interactive move/resize: stubs in the scaffold.
- * These will be implemented in the evilwm behavior layer:
- *   - Super+drag    → move
- *   - Super+RMB drag → resize
- * For now we log and do nothing, which causes the client to receive no
- * acknowledgment and continue in its current state. */
+/*
+ * handle_request_move / handle_request_resize — xdg_toplevel client requests.
+ *
+ * These events fire when a client asks the compositor to initiate an
+ * interactive move or resize (typically in response to a user click on a
+ * titlebar or resize handle). evilWay has neither — we implement
+ * compositor-driven move/resize via Super+drag (begin_move_grab /
+ * begin_resize_grab). Client-initiated requests are silently ignored;
+ * the client will continue in its current state, which is correct.
+ */
 static void handle_request_move(struct wl_listener *listener, void *data) {
     (void)listener;
     (void)data;
-    wlr_log(WLR_DEBUG, "request_move: not yet implemented (Phase 2)");
+    /* No titlebar in evilWay; move is Super+drag only. */
 }
 
 static void handle_request_resize(struct wl_listener *listener, void *data) {
     (void)listener;
     (void)data;
-    wlr_log(WLR_DEBUG, "request_resize: not yet implemented (Phase 2)");
+    /* No resize handle in evilWay; resize is Super+button2+drag only. */
 }
 
 static void handle_request_maximize(struct wl_listener *listener, void *data) {
@@ -881,19 +1725,52 @@ static void handle_new_xdg_toplevel(struct wl_listener *listener, void *data) {
         die("calloc Toplevel");
     tl->server = server;
     tl->xdg_toplevel = xdg_toplevel;
+    ew_window_state_init(&tl->state);
 
-    /* Place the toplevel's scene subtree in the floating layer.
-     * Set scene_tree->node.data = tl so toplevel_at() can find us when
-     * walking up from a leaf buffer node. */
-    tl->scene_tree = wlr_scene_xdg_surface_create(server->layers[LyrFloat],
-        xdg_toplevel->base);
+    /*
+     * Scene graph structure for this window:
+     *
+     *   scene_tree (outer container, in LyrFloat)  ← node.data = tl
+     *   ├── border[0..3]   four wlr_scene_rect border rectangles
+     *   └── surface_tree   wlr_scene_xdg_surface subtree, at (bw,bw) on map
+     *
+     * The outer tree is positioned at (geom.x, geom.y) in layout space.
+     * scene_tree->node.data = tl so toplevel_at() walk-up finds the Toplevel
+     * whether the hit was on a border rect or the client surface.
+     *
+     * xdg_surface->data = surface_tree so handle_new_xdg_popup() can locate
+     * the correct parent tree for popup placement.
+     *
+     * DECISION: this outer-container-plus-surface-tree split matches dwl's
+     * c->scene / c->scene_surface convention. It allows independent sizing
+     * and coloring of border rects without any xdg protocol involvement.
+     */
+    tl->scene_tree = wlr_scene_tree_create(server->layers[LyrFloat]);
     if (!tl->scene_tree)
-        die("wlr_scene_xdg_surface_create");
+        die("wlr_scene_tree_create (outer container)");
     tl->scene_tree->node.data = tl;
 
-    /* Also set xdg_surface->data to the scene_tree so popup children can
-     * find their parent tree (see handle_new_xdg_popup). */
-    xdg_toplevel->base->data = tl->scene_tree;
+    /* Create four border rect children, initially 0×0.
+     * They are sized in toplevel_apply_geometry() on first map.
+     * Color is inactive until the window receives focus. */
+    float inactive_color[4];
+    color_to_float(BORDER_COLOR_INACTIVE, inactive_color);
+    for (int i = 0; i < 4; i++) {
+        tl->border[i] = wlr_scene_rect_create(tl->scene_tree, 0, 0,
+            inactive_color);
+        if (!tl->border[i])
+            die("wlr_scene_rect_create (border)");
+    }
+
+    /* XDG surface subtree as child of outer tree.
+     * Positioned at (bw, bw) within outer tree by toplevel_apply_geometry(). */
+    tl->surface_tree = wlr_scene_xdg_surface_create(tl->scene_tree,
+        xdg_toplevel->base);
+    if (!tl->surface_tree)
+        die("wlr_scene_xdg_surface_create");
+
+    /* xdg_surface->data = surface_tree for popup parent lookup. */
+    xdg_toplevel->base->data = tl->surface_tree;
 
     /* Initialize link so wl_list_remove() in handle_toplevel_destroy is safe
      * even if the surface was never mapped (and thus never inserted). */
