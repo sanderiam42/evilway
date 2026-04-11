@@ -123,9 +123,10 @@ struct Server {
  * One instance per connected monitor. Created on backend new_output event.
  */
 struct Output {
-    struct wl_list          link;
-    struct Server          *server;
-    struct wlr_output      *wlr_output;
+    struct wl_list           link;
+    struct Server           *server;
+    struct wlr_output       *wlr_output;
+    struct wlr_scene_output *scene_output; /* links scene graph to this output */
 
     struct wl_listener frame;
     struct wl_listener request_state;

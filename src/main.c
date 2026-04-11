@@ -56,7 +56,7 @@ static void die(const char *msg) {
  * toplevel_at() — find the Toplevel and wlr_surface under layout coordinates
  * (lx, ly) using the scene graph's node-at lookup.
  *
- * On success, sets *surface_out to the wlr_surface, and *sx/*sy to the
+ * On success, sets *surface_out to the wlr_surface, and *sx, *sy to the
  * surface-local coordinates of the hit point. Returns the owning Toplevel.
  * Returns NULL if no surface is present at those coordinates.
  *
@@ -175,6 +175,7 @@ static void process_cursor_motion(struct Server *server, uint32_t time_msec) {
  * ====================================================================== */
 
 static void handle_kb_modifiers(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Keyboard *kb = wl_container_of(listener, kb, modifiers);
     /*
      * A seat can only have one keyboard in the Wayland protocol, but wlroots
@@ -232,6 +233,7 @@ static void handle_kb_key(struct wl_listener *listener, void *data) {
 }
 
 static void handle_kb_destroy(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Keyboard *kb = wl_container_of(listener, kb, destroy);
     wl_list_remove(&kb->modifiers.link);
     wl_list_remove(&kb->key.link);
@@ -339,6 +341,7 @@ static void handle_cursor_axis(struct wl_listener *listener, void *data) {
 }
 
 static void handle_cursor_frame(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Server *server = wl_container_of(listener, server, cursor_frame);
     /* wl_pointer.frame groups related events (motion+button in one logical action).
      * Must be forwarded so clients can correctly handle grouped pointer events. */
@@ -417,6 +420,7 @@ static void handle_new_input(struct wl_listener *listener, void *data) {
  * ====================================================================== */
 
 static void handle_output_frame(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Output *output = wl_container_of(listener, output, frame);
 
     /* Commit the scene graph to this output. wlroots handles damage tracking,
@@ -445,6 +449,7 @@ static void handle_output_request_state(struct wl_listener *listener, void *data
 }
 
 static void handle_output_destroy(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Output *output = wl_container_of(listener, output, destroy);
     wl_list_remove(&output->frame.link);
     wl_list_remove(&output->request_state.link);
@@ -513,15 +518,15 @@ static void handle_new_output(struct wl_listener *listener, void *data) {
     if (!l_output)
         die("wlr_output_layout_add_auto");
 
-    /* Create the scene output (links the scene graph to this wlr_output). */
-    struct wlr_scene_output *scene_output =
-        wlr_scene_output_create(server->scene, wlr_output);
-    if (!scene_output)
+    /* Create the scene output (links the scene graph to this wlr_output).
+     * Store in output->scene_output so the frame handler can commit to it. */
+    output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
+    if (!output->scene_output)
         die("wlr_scene_output_create");
 
     /* Link the scene output to the output layout output so the scene graph
      * knows where to render each output in the virtual layout space. */
-    wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
+    wlr_scene_output_layout_add_output(server->scene_layout, l_output, output->scene_output);
 
     wlr_log(WLR_INFO, "output connected: %s", wlr_output->name);
 }
@@ -531,6 +536,7 @@ static void handle_new_output(struct wl_listener *listener, void *data) {
  * ====================================================================== */
 
 static void handle_popup_commit(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Popup *popup = wl_container_of(listener, popup, commit);
     /* On initial commit, the compositor must reply with a configure so the
      * client knows the popup has been acknowledged and can map its surface. */
@@ -539,6 +545,7 @@ static void handle_popup_commit(struct wl_listener *listener, void *data) {
 }
 
 static void handle_popup_destroy(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Popup *popup = wl_container_of(listener, popup, destroy);
     wl_list_remove(&popup->commit.link);
     wl_list_remove(&popup->destroy.link);
@@ -546,6 +553,7 @@ static void handle_popup_destroy(struct wl_listener *listener, void *data) {
 }
 
 static void handle_new_xdg_popup(struct wl_listener *listener, void *data) {
+    (void)listener;
     struct wlr_xdg_popup *xdg_popup = data;
 
     struct Popup *popup = calloc(1, sizeof(*popup));
@@ -575,6 +583,7 @@ static void handle_new_xdg_popup(struct wl_listener *listener, void *data) {
  * ====================================================================== */
 
 static void handle_toplevel_map(struct wl_listener *listener, void *data) {
+    (void)data;
     /* Called when the surface is ready to display (first buffer committed
      * after a successful configure roundtrip). */
     struct Toplevel *tl = wl_container_of(listener, tl, map);
@@ -583,6 +592,7 @@ static void handle_toplevel_map(struct wl_listener *listener, void *data) {
 }
 
 static void handle_toplevel_unmap(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Toplevel *tl = wl_container_of(listener, tl, unmap);
 
     /* If this was the focused window, focus the next one in the list. */
@@ -607,6 +617,7 @@ static void handle_toplevel_unmap(struct wl_listener *listener, void *data) {
 }
 
 static void handle_toplevel_commit(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Toplevel *tl = wl_container_of(listener, tl, commit);
 
     /*
@@ -629,6 +640,7 @@ static void handle_toplevel_commit(struct wl_listener *listener, void *data) {
 }
 
 static void handle_toplevel_destroy(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Toplevel *tl = wl_container_of(listener, tl, destroy);
 
     /*
@@ -660,14 +672,19 @@ static void handle_toplevel_destroy(struct wl_listener *listener, void *data) {
  * For now we log and do nothing, which causes the client to receive no
  * acknowledgment and continue in its current state. */
 static void handle_request_move(struct wl_listener *listener, void *data) {
+    (void)listener;
+    (void)data;
     wlr_log(WLR_DEBUG, "request_move: not yet implemented (Phase 3)");
 }
 
 static void handle_request_resize(struct wl_listener *listener, void *data) {
+    (void)listener;
+    (void)data;
     wlr_log(WLR_DEBUG, "request_resize: not yet implemented (Phase 3)");
 }
 
 static void handle_request_maximize(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Toplevel *tl = wl_container_of(listener, tl, request_maximize);
     /* evilWay is floating-only. Deny maximize by sending an empty configure.
      * The client sees no size/state change and stays in its current geometry. */
@@ -675,6 +692,7 @@ static void handle_request_maximize(struct wl_listener *listener, void *data) {
 }
 
 static void handle_request_fullscreen(struct wl_listener *listener, void *data) {
+    (void)data;
     struct Toplevel *tl = wl_container_of(listener, tl, request_fullscreen);
     /* Fullscreen denied in scaffold — revisit in a later phase.
      * Same treatment as maximize: send empty configure to acknowledge and deny. */
@@ -741,7 +759,7 @@ static void handle_new_xdg_toplevel(struct wl_listener *listener, void *data) {
  * main
  * ====================================================================== */
 
-int main(int argc, char *argv[]) {
+int main(void) {
     /* Verbose logging during development. Change to WLR_ERROR for production. */
     wlr_log_init(WLR_DEBUG, NULL);
     wlr_log(WLR_INFO, "evilWay starting");

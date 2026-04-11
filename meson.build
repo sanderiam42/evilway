@@ -75,7 +75,17 @@ endforeach
 # "unstable" designation means wlroots reserves the right to change these APIs
 # across minor versions — it does NOT mean the APIs are unsafe or buggy.
 # Every wlroots compositor must define this macro.
-add_project_arguments('-DWLR_USE_UNSTABLE', language: 'c')
+add_project_arguments([
+  '-DWLR_USE_UNSTABLE',
+  # POSIX.1-2008: required for clock_gettime, setenv, and other POSIX functions
+  # that are not visible under strict -std=c11 without an explicit feature macro.
+  # dwl uses the same flag.
+  '-D_POSIX_C_SOURCE=200809L',
+  # wlr_log() uses the ##__VA_ARGS__ GNU extension to accept zero variadic args,
+  # which is not ISO C99/C11 pedantic-clean. wlroots compositors uniformly
+  # require this extension. Suppress pedantic rather than rewrite every log call.
+  '-Wno-pedantic',
+], language: 'c')
 
 # Debug builds: address sanitizer + undefined behavior sanitizer.
 # These are active throughout development — not optional, not an afterthought.
