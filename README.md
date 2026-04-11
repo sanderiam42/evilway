@@ -31,6 +31,8 @@ Super+Shift+Q. No evilwm behavior yet.
 | Phase | What |
 |---|---|
 | 1a | xdg-shell scaffold ← **you are here** |
+| 1a | ✓ VT switching (Ctrl+Alt+Fn) |
+| 1a | ✓ Terminal launch (Super+Return → foot) |
 | 1b | wlr-layer-shell (waybar must work) |
 | 1c | ext-session-lock-v1 (swaylock must work) |
 | 1d | xdg-output, wlr-screencopy |

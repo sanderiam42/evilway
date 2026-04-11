@@ -28,6 +28,17 @@
 #include <xkbcommon/xkbcommon.h>
 
 /*
+ * Terminal to launch on Super+Return.
+ *
+ * Configuration by recompile — no runtime config file. This follows the
+ * evilwm/dwm philosophy: preferences are compile-time constants, not parsed
+ * at startup. If that decision changes, it gets its own explicit design pass.
+ *
+ * TODO: Move to a config header when the behavior layer is built out.
+ */
+#define TERMINAL "foot"
+
+/*
  * Compositor modifier key.
  *
  * Super (Mod4) maps to the Command (⌘) key on Apple keyboards under
@@ -73,6 +84,11 @@ struct Server {
     struct wlr_backend           *backend;
     struct wlr_renderer          *renderer;
     struct wlr_allocator         *allocator;
+
+    /* Populated by wlr_backend_autocreate() on DRM/KMS (bare hardware).
+     * NULL when running nested (Wayland/X11 backend). Used for VT switching.
+     * wlr_session_change_vt() is a no-op when session is NULL. */
+    struct wlr_session           *session;
 
     /* Scene graph: all rendering flows through here.
      * Never bypass wlr_scene — direct rendering breaks damage tracking,

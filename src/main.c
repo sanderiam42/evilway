@@ -174,6 +174,33 @@ static void process_cursor_motion(struct Server *server, uint32_t time_msec) {
  * Keyboard handlers
  * ====================================================================== */
 
+/*
+ * Spawn TERMINAL as a child of the compositor process.
+ *
+ * fork() + setsid() + execvp() — same pattern as dwl's spawn(). No shell
+ * (no system()), so the terminal name is not subject to shell injection.
+ *
+ * SECURITY: The child inherits the compositor's environment. On a
+ * single-user machine with a TTY-launched compositor the environment is the
+ * user's own login session, set up by PAM and systemd-logind/elogind. No
+ * sanitization is needed beyond what PAM already provides — launching foot
+ * this way is equivalent to opening a terminal from any trusted application
+ * in the same session. WAYLAND_DISPLAY is set by main() via setenv() before
+ * wlr_backend_start(), so the child inherits it automatically. XDG_RUNTIME_DIR
+ * comes from the login session unchanged.
+ *
+ * _exit(1) not exit(1) on exec failure: avoids flushing the parent's stdio
+ * buffers in the child process, which would corrupt the compositor's output.
+ */
+static void spawn_terminal(void) {
+    if (fork() == 0) {
+        setsid();
+        execvp(TERMINAL, (char *[]){TERMINAL, NULL});
+        fprintf(stderr, "evilway: exec %s failed\n", TERMINAL);
+        _exit(1);
+    }
+}
+
 static void handle_kb_modifiers(struct wl_listener *listener, void *data) {
     (void)data;
     struct Keyboard *kb = wl_container_of(listener, kb, modifiers);
@@ -211,6 +238,36 @@ static void handle_kb_key(struct wl_listener *listener, void *data) {
      */
     if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         for (int i = 0; i < nsyms; i++) {
+            /*
+             * SECURITY: VT switching is consumed here and never forwarded to
+             * any client. A client that can trigger VT switches can escape the
+             * session (switch to an unlocked TTY or another user's session).
+             *
+             * XKB translates Ctrl+Alt+Fn → XKB_KEY_XF86Switch_VT_n before the
+             * compositor sees the event — no modifier check is needed here
+             * because this keysym is only produced when Ctrl+Alt is held.
+             *
+             * Mac/Asahi note: Fn+function-key produces the standard function
+             * keysym; the XKB Ctrl+Alt rule then maps it to XF86Switch_VT_n
+             * identically to any other keyboard. No special handling required.
+             *
+             * session is NULL when running nested (Wayland/X11 backend) —
+             * the NULL guard below makes VT switching a safe no-op in that
+             * case rather than a crash or undefined behavior. */
+            if (syms[i] >= XKB_KEY_XF86Switch_VT_1 &&
+                    syms[i] <= XKB_KEY_XF86Switch_VT_12) {
+                if (server->session)
+                    wlr_session_change_vt(server->session,
+                        syms[i] - XKB_KEY_XF86Switch_VT_1 + 1);
+                handled = true;
+            }
+
+            if ((modifiers & MODIFIER) && syms[i] == XKB_KEY_Return) {
+                /* Super+Return — launch terminal (evilwm convention). */
+                spawn_terminal();
+                handled = true;
+            }
+
             if ((modifiers & MODIFIER) && (modifiers & WLR_MODIFIER_SHIFT)
                     && syms[i] == XKB_KEY_Q) {
                 /* Super+Shift+Q — exit the compositor cleanly. */
@@ -780,7 +837,7 @@ int main(void) {
      * X11 or Wayland when running nested for development. The session
      * (logind/seatd) is managed by the backend automatically. */
     server.backend = wlr_backend_autocreate(
-        wl_display_get_event_loop(server.display), NULL);
+        wl_display_get_event_loop(server.display), &server.session);
     if (!server.backend)
         die("wlr_backend_autocreate");
 
