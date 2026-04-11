@@ -105,7 +105,7 @@ endif
 #      include path, so `#include "xdg-shell-protocol.h"` resolves correctly
 #      even though the file lives in the build directory, not the source tree.
 executable('evilway',
-  sources: ['src/main.c'] + proto_headers,
+  sources: ['src/main.c', 'src/config.c'] + proto_headers,
   include_directories: ['include'],
   dependencies: [wlroots, wayland, xkbcommon],
   install: true,

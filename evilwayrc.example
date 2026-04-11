@@ -1,0 +1,107 @@
+# evilWay configuration file
+#
+# Copy to ~/.evilwayrc and edit. evilWay reads this file on startup and on
+# SIGHUP (kill -HUP <pid>). Blank lines and lines starting with '#' are
+# ignored. Option names have no leading dashes (same format as evilwm's
+# .evilwmrc).
+#
+# All settings are optional. Missing settings use built-in defaults.
+
+# ---- Visual ----------------------------------------------------------------
+
+# bw: window border width in pixels.
+# Default: 1. Range: 1–20.
+bw 2
+
+# snap: snap-to-edge distance in pixels. Windows snap to screen edges and
+# to other window edges when dragged within this distance.
+# Default: 0 (disabled). Range: 0–100.
+snap 10
+
+# ---- Behaviour -------------------------------------------------------------
+
+# term: terminal emulator to launch on the spawn bind (Super+Return by default).
+# Must be on $PATH. No shell expansion — use the bare executable name or an
+# absolute path.
+# Default: foot
+term foot
+
+# numvdesks: number of virtual desktops.
+# Default: 4. Range: 1–16.
+numvdesks 4
+
+# ---- Key and mouse bindings ------------------------------------------------
+#
+# Syntax:  bind TRIGGER=FUNCTION[,FLAGS]
+#
+# TRIGGER:
+#   Keyboard: [Modifier+]...KeyName
+#     Valid modifiers: Super, Shift, Control (or Ctrl), Alt
+#     KeyName: any XKB key name (Return, h, Left, F1, Escape, Tab, …)
+#   Mouse:    button1 through button5
+#             button1=left  button2=middle  button3=right
+#
+# FUNCTION: spawn | delete | kill | lower | raise | move | resize |
+#           fix | vdesk | next | dock | info
+#
+# FLAGS (joined with +, placed after comma):
+#   relative, toggle, top, bottom, left, right, up, down,
+#   horizontal (or h), vertical (or v)
+#   OR a bare integer target for vdesk (0-based desktop number)
+#
+# Super+Shift+Q is the emergency compositor exit. It is hardcoded and cannot
+# be changed or removed here — this is intentional.
+
+# Spawn terminal
+bind Super+Return=spawn
+
+# Window management
+bind Super+d=delete
+bind Super+Shift+d=kill
+bind Super+Tab=next
+
+# Move window incrementally (evilwm-style keyboard move)
+bind Super+h=move,relative+left
+bind Super+j=move,relative+down
+bind Super+k=move,relative+up
+bind Super+l=move,relative+right
+
+# Move window to screen corners
+bind Super+y=move,top+left
+bind Super+u=move,top+right
+bind Super+b=move,bottom+left
+bind Super+n=move,bottom+right
+
+# Resize window
+bind Super+Shift+h=resize,relative+left
+bind Super+Shift+j=resize,relative+down
+bind Super+Shift+k=resize,relative+up
+bind Super+Shift+l=resize,relative+right
+
+# Toggle maximise states
+bind Super+equal=resize,toggle+v
+bind Super+Shift+equal=resize,toggle+h
+bind Super+x=resize,toggle+v+h
+
+# Lower window in stacking order
+bind Super+Insert=lower
+
+# Fix window (sticky: visible on all virtual desktops)
+bind Super+f=fix
+
+# Virtual desktops (absolute: 0-based)
+bind Super+1=vdesk,0
+bind Super+2=vdesk,1
+bind Super+3=vdesk,2
+bind Super+4=vdesk,3
+bind Super+5=vdesk,4
+bind Super+6=vdesk,5
+bind Super+7=vdesk,6
+bind Super+8=vdesk,7
+
+# Virtual desktops (relative navigation)
+bind Super+Left=vdesk,relative+left
+bind Super+Right=vdesk,relative+right
+
+# Show window info overlay
+bind Super+i=info

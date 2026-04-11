@@ -16,8 +16,9 @@
  * and all rendered output on the machine. Key invariants enforced here:
  *
  *   INPUT:   Compositor keybindings (Super+Shift+Q, etc.) are checked and
- *            consumed BEFORE the key event is forwarded to any client. A client
- *            cannot intercept or observe compositor-level shortcuts.
+ *            consumed BEFORE the key event is forwarded to any client. This is
+ *            the enforcement point that prevents clients from intercepting
+ *            compositor-level shortcuts.
  *
  *   SOCKET:  The Wayland socket is created by wl_display_add_socket_auto() in
  *            $XDG_RUNTIME_DIR with 0600 permissions, owned by the session user.
@@ -35,12 +36,15 @@
  */
 
 #include <assert.h>
+#include <linux/input-event-codes.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "config.h"
 #include "evilway.h"
 
 /* =========================================================================
@@ -171,35 +175,99 @@ static void process_cursor_motion(struct Server *server, uint32_t time_msec) {
 }
 
 /* =========================================================================
- * Keyboard handlers
+ * Bind dispatch
  * ====================================================================== */
 
 /*
- * Spawn TERMINAL as a child of the compositor process.
+ * spawn_terminal — fork and exec the configured terminal.
  *
  * fork() + setsid() + execvp() — same pattern as dwl's spawn(). No shell
- * (no system()), so the terminal name is not subject to shell injection.
+ * involved (no system(), no popen()), so the terminal name cannot be subject
+ * to shell injection.
  *
  * SECURITY: The child inherits the compositor's environment. On a
  * single-user machine with a TTY-launched compositor the environment is the
  * user's own login session, set up by PAM and systemd-logind/elogind. No
- * sanitization is needed beyond what PAM already provides — launching foot
- * this way is equivalent to opening a terminal from any trusted application
- * in the same session. WAYLAND_DISPLAY is set by main() via setenv() before
- * wlr_backend_start(), so the child inherits it automatically. XDG_RUNTIME_DIR
- * comes from the login session unchanged.
+ * sanitization is needed beyond what PAM already provides. WAYLAND_DISPLAY
+ * is set by main() via setenv() before wlr_backend_start(), so the child
+ * inherits it automatically. XDG_RUNTIME_DIR comes from the login session
+ * unchanged.
  *
  * _exit(1) not exit(1) on exec failure: avoids flushing the parent's stdio
  * buffers in the child process, which would corrupt the compositor's output.
+ *
+ * The terminal path comes from EwConfig.terminal, not a hardcoded #define.
+ * It is bounded to 255 chars by the config parser; execvp() receives exactly
+ * what was in the config file (no shell expansion, no globbing).
  */
-static void spawn_terminal(void) {
+static void spawn_terminal(const char *term) {
     if (fork() == 0) {
         setsid();
-        execvp(TERMINAL, (char *[]){TERMINAL, NULL});
-        fprintf(stderr, "evilway: exec %s failed\n", TERMINAL);
+        execvp(term, (char *[]){(char *)term, NULL});
+        fprintf(stderr, "evilway: exec %s failed\n", term);
         _exit(1);
     }
 }
+
+/*
+ * dispatch_bind — execute the action described by *bind.
+ *
+ * Called from both keyboard and mouse event handlers after a bind has been
+ * matched. Currently only FUNC_SPAWN is implemented (spawns the configured
+ * terminal). All other functions are stubs logged at WLR_DEBUG level — they
+ * will be filled in during the evilwm behavior layer phase.
+ *
+ * SECURITY: No system() or popen() here or in any called function. The only
+ * exec path is spawn_terminal() which goes fork+execvp directly.
+ */
+static void dispatch_bind(struct Server *server, const EwBind *bind) {
+    switch (bind->function) {
+    case FUNC_SPAWN:
+        spawn_terminal(server->config.terminal);
+        break;
+
+    case FUNC_DELETE:
+        wlr_log(WLR_DEBUG, "bind: delete — not yet implemented (Phase 2)");
+        break;
+    case FUNC_KILL:
+        wlr_log(WLR_DEBUG, "bind: kill — not yet implemented (Phase 2)");
+        break;
+    case FUNC_LOWER:
+        wlr_log(WLR_DEBUG, "bind: lower — not yet implemented (Phase 2)");
+        break;
+    case FUNC_RAISE:
+        wlr_log(WLR_DEBUG, "bind: raise — not yet implemented (Phase 2)");
+        break;
+    case FUNC_MOVE:
+        wlr_log(WLR_DEBUG, "bind: move flags=0x%x — not yet implemented (Phase 2)",
+            bind->flags);
+        break;
+    case FUNC_RESIZE:
+        wlr_log(WLR_DEBUG, "bind: resize flags=0x%x — not yet implemented (Phase 2)",
+            bind->flags);
+        break;
+    case FUNC_FIX:
+        wlr_log(WLR_DEBUG, "bind: fix — not yet implemented (Phase 2)");
+        break;
+    case FUNC_VDESK:
+        wlr_log(WLR_DEBUG, "bind: vdesk target=%d flags=0x%x — not yet implemented (Phase 2)",
+            bind->vdesk_target, bind->flags);
+        break;
+    case FUNC_NEXT:
+        wlr_log(WLR_DEBUG, "bind: next — not yet implemented (Phase 2)");
+        break;
+    case FUNC_DOCK:
+        wlr_log(WLR_DEBUG, "bind: dock — not yet implemented (Phase 2)");
+        break;
+    case FUNC_INFO:
+        wlr_log(WLR_DEBUG, "bind: info — not yet implemented (Phase 2)");
+        break;
+    }
+}
+
+/* =========================================================================
+ * Keyboard handlers
+ * ====================================================================== */
 
 static void handle_kb_modifiers(struct wl_listener *listener, void *data) {
     (void)data;
@@ -247,37 +315,54 @@ static void handle_kb_key(struct wl_listener *listener, void *data) {
              * compositor sees the event — no modifier check is needed here
              * because this keysym is only produced when Ctrl+Alt is held.
              *
-             * Mac/Asahi note: Fn+function-key produces the standard function
-             * keysym; the XKB Ctrl+Alt rule then maps it to XF86Switch_VT_n
-             * identically to any other keyboard. No special handling required.
-             *
              * session is NULL when running nested (Wayland/X11 backend) —
              * the NULL guard below makes VT switching a safe no-op in that
-             * case rather than a crash or undefined behavior. */
+             * case rather than a crash.
+             */
             if (syms[i] >= XKB_KEY_XF86Switch_VT_1 &&
                     syms[i] <= XKB_KEY_XF86Switch_VT_12) {
                 if (server->session)
                     wlr_session_change_vt(server->session,
                         syms[i] - XKB_KEY_XF86Switch_VT_1 + 1);
                 handled = true;
+                continue;
             }
 
-            if ((modifiers & MODIFIER) && syms[i] == XKB_KEY_Return) {
-                /* Super+Return — launch terminal (evilwm convention). */
-                spawn_terminal();
-                handled = true;
-            }
-
+            /*
+             * SECURITY: Super+Shift+Q is the compositor emergency exit.
+             * It is hardcoded here and NOT exposed through the config bind
+             * system. This ensures the user always has a way out even if
+             * the config file is malformed or all configured binds are broken.
+             * A config file that accidentally omits this bind cannot trap
+             * the user.
+             */
             if ((modifiers & MODIFIER) && (modifiers & WLR_MODIFIER_SHIFT)
                     && syms[i] == XKB_KEY_Q) {
-                /* Super+Shift+Q — exit the compositor cleanly. */
                 wlr_log(WLR_INFO, "Super+Shift+Q: terminating compositor");
                 wl_display_terminate(server->display);
                 handled = true;
+                continue;
             }
-            /* Additional keybindings will be added here in the evilwm behavior
-             * phase: Super+arrow for move/resize, Super+F1–F9 for virtual
-             * desktops, etc. All must be consumed before the dispatch below. */
+
+            /*
+             * Check user-configured keyboard binds.
+             *
+             * Matching: exact modifier mask equality (not bitwise AND). This
+             * means Super+Shift+Return does NOT fire a Super+Return bind —
+             * the extra Shift modifier prevents the match. This is intentional
+             * and matches evilwm's behavior.
+             */
+            for (size_t j = 0; j < server->config.num_binds; j++) {
+                const EwBind *b = &server->config.binds[j];
+                if (!b->is_mouse &&
+                        b->modifiers == modifiers &&
+                        b->keysym    == syms[i]) {
+                    dispatch_bind(server, b);
+                    handled = true;
+                    /* Do not break — multiple binds on the same key are
+                     * unusual but not forbidden. */
+                }
+            }
         }
     }
 
@@ -310,7 +395,7 @@ static void create_keyboard(struct Server *server, struct wlr_input_device *devi
 
     /* Compile a default XKB keymap using the system locale.
      * A later phase will read layout/variant from environment variables
-     * (XKB_DEFAULT_LAYOUT, etc.) or a config header. */
+     * (XKB_DEFAULT_LAYOUT, etc.) or the config file. */
     struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!ctx) {
         wlr_log(WLR_ERROR, "xkb_context_new failed, skipping keyboard");
@@ -369,6 +454,24 @@ static void handle_cursor_motion_absolute(struct wl_listener *listener, void *da
     process_cursor_motion(server, event->time_msec);
 }
 
+/*
+ * Button number → Linux evdev code mapping for mouse binds.
+ * Index by config button number (1–5); index 0 is unused (sentinel 0).
+ *
+ * evilwm/X11 convention:  button1=left, button2=middle, button3=right.
+ * Linux evdev layout:      BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112.
+ * Note that evdev right < middle numerically — the config numbers do NOT map
+ * linearly to evdev codes; we use an explicit table.
+ */
+static const uint32_t button_evdev[6] = {
+    0,           /* index 0: unused */
+    BTN_LEFT,    /* button1 */
+    BTN_MIDDLE,  /* button2 */
+    BTN_RIGHT,   /* button3 */
+    BTN_SIDE,    /* button4 */
+    BTN_EXTRA,   /* button5 */
+};
+
 static void handle_cursor_button(struct wl_listener *listener, void *data) {
     struct Server *server = wl_container_of(listener, server, cursor_button);
     struct wlr_pointer_button_event *event = data;
@@ -386,6 +489,19 @@ static void handle_cursor_button(struct wl_listener *listener, void *data) {
         struct Toplevel *tl = toplevel_at(server,
             server->cursor->x, server->cursor->y, &surface, &sx, &sy);
         focus_toplevel(tl);
+
+        /* Check user-configured mouse binds.
+         * Mouse binds do not filter on keyboard modifier state in this phase.
+         * The evilwm behavior layer (Super+drag, Super+RMB drag) will add
+         * modifier-aware mouse handling when move/resize are implemented. */
+        for (size_t i = 0; i < server->config.num_binds; i++) {
+            const EwBind *b = &server->config.binds[i];
+            if (b->is_mouse &&
+                    b->button >= 1 && b->button <= 5 &&
+                    button_evdev[b->button] == event->button) {
+                dispatch_bind(server, b);
+            }
+        }
     }
 }
 
@@ -583,7 +699,8 @@ static void handle_new_output(struct wl_listener *listener, void *data) {
 
     /* Link the scene output to the output layout output so the scene graph
      * knows where to render each output in the virtual layout space. */
-    wlr_scene_output_layout_add_output(server->scene_layout, l_output, output->scene_output);
+    wlr_scene_output_layout_add_output(server->scene_layout, l_output,
+        output->scene_output);
 
     wlr_log(WLR_INFO, "output connected: %s", wlr_output->name);
 }
@@ -656,7 +773,6 @@ static void handle_toplevel_unmap(struct wl_listener *listener, void *data) {
     struct wlr_seat *seat = tl->server->seat;
     if (seat->keyboard_state.focused_surface == tl->xdg_toplevel->base->surface) {
         struct Toplevel *next = NULL;
-        /* toplevels.next after remove would be the next candidate. Check first. */
         if (tl->link.next != &tl->server->toplevels) {
             next = wl_container_of(tl->link.next, next, link);
         }
@@ -731,13 +847,13 @@ static void handle_toplevel_destroy(struct wl_listener *listener, void *data) {
 static void handle_request_move(struct wl_listener *listener, void *data) {
     (void)listener;
     (void)data;
-    wlr_log(WLR_DEBUG, "request_move: not yet implemented (Phase 3)");
+    wlr_log(WLR_DEBUG, "request_move: not yet implemented (Phase 2)");
 }
 
 static void handle_request_resize(struct wl_listener *listener, void *data) {
     (void)listener;
     (void)data;
-    wlr_log(WLR_DEBUG, "request_resize: not yet implemented (Phase 3)");
+    wlr_log(WLR_DEBUG, "request_resize: not yet implemented (Phase 2)");
 }
 
 static void handle_request_maximize(struct wl_listener *listener, void *data) {
@@ -807,9 +923,61 @@ static void handle_new_xdg_toplevel(struct wl_listener *listener, void *data) {
     wl_signal_add(&xdg_toplevel->events.request_maximize, &tl->request_maximize);
 
     tl->request_fullscreen.notify = handle_request_fullscreen;
-    wl_signal_add(&xdg_toplevel->events.request_fullscreen, &tl->request_fullscreen);
+    wl_signal_add(&xdg_toplevel->events.request_fullscreen,
+        &tl->request_fullscreen);
 
-    wlr_log(WLR_DEBUG, "new toplevel: %s", xdg_toplevel->title ? xdg_toplevel->title : "(no title)");
+    wlr_log(WLR_DEBUG, "new toplevel: %s",
+        xdg_toplevel->title ? xdg_toplevel->title : "(no title)");
+}
+
+/* =========================================================================
+ * SIGHUP — config reload
+ * ====================================================================== */
+
+/*
+ * handle_sighup — reload config on SIGHUP.
+ *
+ * This callback is registered via wl_event_loop_add_signal(), which uses
+ * signalfd() internally. The callback runs within the normal Wayland event
+ * loop dispatch — NOT from a signal handler context. This means malloc(),
+ * stdio, and all wlroots calls are safe here.
+ *
+ * SECURITY: We load into a fresh EwConfig first. Only if config_load()
+ * succeeds do we replace the live config. A failed reload leaves the current
+ * config completely intact — the compositor never operates with a partially-
+ * parsed config.
+ *
+ * Validation after reload: config_load() itself validates and clamps all
+ * values. Bind entries with invalid keysyms or function names are rejected
+ * during parse and never reach the live config.
+ */
+static int handle_sighup(int sig, void *data) {
+    (void)sig;
+    struct Server *server = data;
+
+    wlr_log(WLR_INFO, "SIGHUP received — reloading config");
+
+    EwConfig new_config;
+    if (!config_load(&new_config)) {
+        /* malloc failure during reload — keep the current config. */
+        fprintf(stderr,
+            "evilway: config reload failed (out of memory), "
+            "continuing with current config\n");
+        config_free(&new_config);
+        return 0;
+    }
+
+    config_free(&server->config);
+    server->config = new_config;
+
+    wlr_log(WLR_INFO,
+        "config reloaded: %zu bind(s), bw=%d snap=%d term=%s vdesks=%d",
+        server->config.num_binds,
+        server->config.border_width,
+        server->config.snap_distance,
+        server->config.terminal,
+        server->config.num_vdesks);
+    return 0;
 }
 
 /* =========================================================================
@@ -825,6 +993,12 @@ int main(void) {
     wl_list_init(&server.outputs);
     wl_list_init(&server.toplevels);
     wl_list_init(&server.keyboards);
+
+    /* ---- Load config ----
+     * Must happen before any keybinding or terminal reference. Establishes
+     * defaults if ~/.evilwayrc is absent. Fatal on malloc failure only. */
+    if (!config_load(&server.config))
+        die("config_load");
 
     /* ---- Wayland display ---- */
     server.display = wl_display_create();
@@ -906,7 +1080,8 @@ int main(void) {
         die("wlr_xdg_shell_create");
 
     server.new_xdg_toplevel.notify = handle_new_xdg_toplevel;
-    wl_signal_add(&server.xdg_shell->events.new_toplevel, &server.new_xdg_toplevel);
+    wl_signal_add(&server.xdg_shell->events.new_toplevel,
+        &server.new_xdg_toplevel);
 
     server.new_xdg_popup.notify = handle_new_xdg_popup;
     wl_signal_add(&server.xdg_shell->events.new_popup, &server.new_xdg_popup);
@@ -946,7 +1121,8 @@ int main(void) {
         die("wlr_seat_create");
 
     server.request_cursor.notify = handle_request_cursor;
-    wl_signal_add(&server.seat->events.request_set_cursor, &server.request_cursor);
+    wl_signal_add(&server.seat->events.request_set_cursor,
+        &server.request_cursor);
 
     server.pointer_focus_change.notify = handle_pointer_focus_change;
     wl_signal_add(&server.seat->pointer_state.events.focus_change,
@@ -962,6 +1138,31 @@ int main(void) {
 
     server.new_input.notify = handle_new_input;
     wl_signal_add(&server.backend->events.new_input, &server.new_input);
+
+    /* ---- SIGHUP handler for config reload ----
+     *
+     * wl_event_loop_add_signal() uses signalfd() internally. The callback
+     * (handle_sighup) fires as a normal event loop event, NOT from a Unix
+     * signal handler context. This means the callback may safely allocate
+     * memory and call any wlroots or stdio functions.
+     *
+     * DECISION over volatile sig_atomic_t + self-pipe: wl_event_loop_add_signal
+     * IS the idiomatic wlroots approach and provides the same "process in event
+     * loop, not signal handler" guarantee without the extra pipe fd. It also
+     * avoids the EINTR hazard on slow system calls that a bare signal() handler
+     * introduces.
+     *
+     * The source is stored in server.sighup_source so it can be removed
+     * cleanly during shutdown (wl_event_source_remove). Forgetting to remove
+     * it before the event loop is destroyed is safe (the loop tears down all
+     * sources), but explicit removal is cleaner.
+     */
+    struct wl_event_loop *loop = wl_display_get_event_loop(server.display);
+    server.sighup_source = wl_event_loop_add_signal(loop, SIGHUP,
+        handle_sighup, &server);
+    if (!server.sighup_source)
+        wlr_log(WLR_ERROR,
+            "failed to register SIGHUP handler — config reload will not work");
 
     /* ---- Wayland socket ----
      * SECURITY: wl_display_add_socket_auto() creates the Unix socket in
@@ -1000,10 +1201,13 @@ int main(void) {
         die("wlr_backend_start");
     }
 
-    wlr_log(WLR_INFO, "evilWay running — exit with Super+Shift+Q");
+    wlr_log(WLR_INFO,
+        "evilWay running — exit with Super+Shift+Q  "
+        "(send SIGHUP to reload config)");
 
     /* ---- Event loop ----
-     * Runs until wl_display_terminate() is called (e.g. from Super+Shift+Q). */
+     * Runs until wl_display_terminate() is called (e.g. from Super+Shift+Q).
+     * SIGHUP events are dispatched here via handle_sighup(). */
     wl_display_run(server.display);
 
     /* ---- Cleanup ----
@@ -1011,6 +1215,12 @@ int main(void) {
      * first — gives clients a chance to clean up before we tear down globals. */
     wlr_log(WLR_INFO, "evilWay shutting down");
     wl_display_destroy_clients(server.display);
+
+    if (server.sighup_source)
+        wl_event_source_remove(server.sighup_source);
+
+    config_free(&server.config);
+
     wlr_xcursor_manager_destroy(server.cursor_mgr);
     wlr_cursor_destroy(server.cursor);
     wlr_scene_node_destroy(&server.scene->tree.node);

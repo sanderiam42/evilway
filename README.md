@@ -24,7 +24,8 @@ behavior as its specification.
 
 **Scaffold (Phase 1a):** xdg-shell only. Starts a compositor session, opens an
 output, accepts xdg-shell client connections and renders them. Exits cleanly on
-Super+Shift+Q. No evilwm behavior yet.
+Super+Shift+Q. Runtime config system implemented. No evilwm window-management
+behavior yet.
 
 ### Implementation roadmap
 
@@ -32,13 +33,78 @@ Super+Shift+Q. No evilwm behavior yet.
 |---|---|
 | 1a | xdg-shell scaffold ← **you are here** |
 | 1a | ✓ VT switching (Ctrl+Alt+Fn) |
-| 1a | ✓ Terminal launch (Super+Return → foot) |
+| 1a | ✓ Terminal launch (Super+Return → foot, configurable) |
+| 1a | ✓ Runtime config file (~/.evilwayrc, SIGHUP reload) |
 | 1b | wlr-layer-shell (waybar must work) |
 | 1c | ext-session-lock-v1 (swaylock must work) |
 | 1d | xdg-output, wlr-screencopy |
 | 1e | XWayland |
 | 2  | evilwm behavior layer on top of working compositor |
 | 3  | YubiKey Bio PAM integration (pam_u2f on login/sudo/swaylock) |
+
+## Configuration
+
+evilWay reads `~/.evilwayrc` on startup and reloads it when sent SIGHUP.
+File absent is not an error — built-in defaults are used silently.
+
+Format is identical to evilwm's `.evilwmrc`: one option per line, no leading
+dashes, arguments separated by whitespace, comments start with `#`.
+
+### Reload
+
+```sh
+kill -HUP $(pidof evilway)
+```
+
+The compositor continues running during the reload. If the new config cannot
+be parsed (malloc failure), the previous config is kept intact.
+
+### Options
+
+| Key | Default | Range | Description |
+|---|---|---|---|
+| `bw` | `1` | 1–20 | Window border width in pixels |
+| `snap` | `0` | 0–100 | Snap-to-edge distance in pixels (0 = disabled) |
+| `term` | `foot` | — | Terminal to spawn on the spawn bind |
+| `numvdesks` | `4` | 1–16 | Number of virtual desktops |
+| `bind` | — | — | Keyboard or mouse binding (see below) |
+
+### Bind syntax
+
+```
+bind TRIGGER=FUNCTION[,FLAGS]
+```
+
+**Trigger** — keyboard:
+```
+bind Super+Return=spawn
+bind Super+Shift+h=resize,relative+left
+bind Control+Alt+t=spawn
+```
+
+**Trigger** — mouse button (button1=left, button2=middle, button3=right):
+```
+bind button3=lower
+```
+
+**Functions:** `spawn`, `delete`, `kill`, `lower`, `raise`, `move`, `resize`,
+`fix`, `vdesk`, `next`, `dock`, `info`
+
+**Flags** (joined with `+`): `relative`, `toggle`, `top`, `bottom`, `left`,
+`right`, `up`, `down`, `horizontal` (or `h`), `vertical` (or `v`)
+
+**vdesk** accepts either flags or a bare integer desktop number (0-based):
+```
+bind Super+1=vdesk,0
+bind Super+Left=vdesk,relative+left
+bind Super+x=resize,toggle+v+h
+```
+
+**Super+Shift+Q** is the compositor emergency exit. It is hardcoded and cannot
+be removed or reassigned in the config file.
+
+Copy `evilwayrc.example` from the repo root to `~/.evilwayrc` for a working
+starting point with full documentation.
 
 ## Architecture
 
