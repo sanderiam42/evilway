@@ -23,6 +23,7 @@
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_output_management_v1.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
@@ -219,6 +220,16 @@ struct Server {
 
     struct wlr_output_layout     *output_layout;
     struct wl_list                outputs;    /* Output::link */
+
+    /* wlr-output-management-v1 — lets wlr-randr and kanshi configure outputs.
+     * NULL if wlr_output_manager_v1_create() failed at init time (non-fatal:
+     * compositor runs without output management support in that case).
+     *
+     * SECURITY: wlroots does not authenticate clients using this protocol.
+     * See the security note in src/output.c. */
+    struct wlr_output_manager_v1 *output_manager;
+    struct wl_listener            output_manager_apply;
+    struct wl_listener            output_manager_test;
 
     struct wlr_xdg_shell         *xdg_shell;
     struct wl_list                toplevels;  /* Toplevel::link, front = focused */

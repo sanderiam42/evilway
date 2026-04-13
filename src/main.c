@@ -47,6 +47,7 @@
 
 #include "config.h"
 #include "evilway.h"
+#include "output.h"
 #include "window.h"
 
 /* =========================================================================
@@ -1478,6 +1479,12 @@ static void handle_new_output(struct wl_listener *listener, void *data) {
         output->scene_output);
 
     wlr_log(WLR_INFO, "output connected: %s", wlr_output->name);
+
+    /* Advertise the new output to the output management protocol.
+     * wlr-randr and kanshi discover outputs by receiving this broadcast.
+     * Called after the output is fully wired into the layout so the snapshot
+     * reflects the correct position. */
+    output_mgmt_notify_layout_changed(server);
 }
 
 /* =========================================================================
@@ -1926,6 +1933,13 @@ int main(void) {
     server.output_layout = wlr_output_layout_create(server.display);
     if (!server.output_layout)
         die("wlr_output_layout_create");
+
+    /* ---- Output management protocol ----
+     * Registers the zwlr_output_manager_v1 global so wlr-randr and kanshi
+     * can query and configure outputs. Must be initialized after wl_display
+     * and output_layout exist, before wlr_backend_start() fires new_output
+     * events (so the manager is ready to receive the initial output set). */
+    output_mgmt_init(&server);
 
     /* ---- Scene graph ----
      * All rendering flows through wlr_scene. Bypassing it would break damage

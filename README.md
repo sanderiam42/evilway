@@ -106,6 +106,60 @@ be removed or reassigned in the config file.
 Copy `evilwayrc.example` from the repo root to `~/.evilwayrc` for a working
 starting point with full documentation.
 
+## Output configuration
+
+evilWay implements the `wlr-output-management-v1` protocol. Output configuration
+(resolution, refresh rate, scale, position, orientation) is handled entirely by
+external tools — evilWay does not implement its own resolution controls.
+
+**wlr-randr** — manual, one-shot output configuration (analogous to `xrandr`):
+
+```sh
+sudo dnf install wlr-randr
+
+# List all outputs and current modes
+wlr-randr
+
+# Set a specific mode on a named output
+wlr-randr --output DP-1 --mode 2560x1440@144
+
+# Set scale (for HiDPI)
+wlr-randr --output eDP-1 --scale 2
+```
+
+**kanshi** — persistent, profile-based output configuration (different profiles for
+docked vs undocked, multiple monitor combinations):
+
+```sh
+sudo dnf install kanshi
+```
+
+Configuration lives in `~/.config/kanshi/config`, not in `~/.evilwayrc`.
+Example:
+
+```
+# Laptop standalone
+profile laptop {
+    output eDP-1 enable scale 2
+}
+
+# Docked — laptop + external monitor
+profile docked {
+    output eDP-1 enable position 1920,0 scale 2
+    output DP-1 enable mode 1920x1080@60 position 0,0
+}
+```
+
+Run kanshi at session start, not inside the compositor:
+
+```sh
+# Add to ~/.bash_profile (after evilway starts):
+kanshi &
+```
+
+kanshi reads `$WAYLAND_DISPLAY` from the environment, which evilWay sets on
+startup. It will apply the matching profile automatically.
+
 ## Architecture
 
 Built on [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) 0.19, using
