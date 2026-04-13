@@ -1546,20 +1546,49 @@ static void handle_toplevel_map(struct wl_listener *listener, void *data) {
      * chosen its size and we can read it back to set our initial geometry.
      *
      * Initial geometry: window is centered on the first output at its
-     * natural size plus borders. If the client didn't set an explicit xdg
-     * window geometry we fall back to the committed surface dimensions.
+     * natural size plus borders. Size is read from xdg_surface window
+     * geometry (logical coordinates). See the comment below for why
+     * wlr_surface buffer dimensions must not be used here.
      */
     struct Toplevel *tl = wl_container_of(listener, tl, map);
     struct Server *server = tl->server;
     int bw = server->config.border_width;
 
-    /* Read the client's natural content size. */
+    /*
+     * Read the client's logical content size from the xdg_surface window geometry.
+     *
+     * wlr_xdg_surface->current.geometry is in surface-local (logical) coordinates,
+     * as set by xdg_surface.set_window_geometry. wlroots auto-populates this field
+     * from the committed surface bounds when the client has not called
+     * set_window_geometry explicitly, so it is always in logical coordinates for
+     * any surface that has completed the configure/commit roundtrip.
+     *
+     * SCALE BUG FIX: the previous code fell back to surface->current.width/height
+     * when current.geometry.width was zero. At output scale 2, surface->current
+     * dimensions reflect buffer pixel counts, not logical coordinates — a Firefox
+     * window's buffer is 2× its logical size. This made tl->state.geom half the
+     * correct logical width/height: the bottom and right border rects landed at the
+     * window's logical midpoint rather than its edges, and the scene-node hit area
+     * only covered the top-left quadrant of the visually rendered window, so
+     * pointer focus and raise-on-click silently failed outside that quadrant.
+     *
+     * SECURITY: using incorrect geometry means pointer events land in the wrong
+     * window. A user believes they are interacting with one window while input is
+     * routed to another. Never read wlr_surface buffer dimensions for geometry.
+     *
+     * The compositor must not multiply or divide by the output scale factor
+     * manually. All window geometry is in logical (pre-scale) coordinates; the
+     * scale factor lives at the output layer and wlroots applies it internally.
+     */
     struct wlr_box xdg_geom = tl->xdg_toplevel->base->current.geometry;
-    int sw = (xdg_geom.width  > 0) ? xdg_geom.width
-                                    : tl->xdg_toplevel->base->surface->current.width;
-    int sh = (xdg_geom.height > 0) ? xdg_geom.height
-                                    : tl->xdg_toplevel->base->surface->current.height;
-    /* Fallback if surface hasn't committed a real buffer yet. */
+    int sw = xdg_geom.width;
+    int sh = xdg_geom.height;
+    /*
+     * Fallback: xdg_geom is zero only for a degenerate client that maps before
+     * completing the configure/commit roundtrip. In normal operation wlroots
+     * populates current.geometry from the committed surface bounds, so this
+     * branch is unreachable for well-behaved clients (foot, Firefox, etc.).
+     */
     if (sw <= 0) sw = 640;
     if (sh <= 0) sh = 480;
 
