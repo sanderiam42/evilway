@@ -3,168 +3,27 @@
 A Wayland compositor for Fedora Asahi (aarch64) that implements the
 [evilwm](https://www.6809.org.uk/evilwm/) interaction model.
 
-This is **not a port** of evilwm. evilwm is X11-only and cannot be ported to
-Wayland. evilWay is a new compositor, written from scratch in C using
-[wlroots](https://gitlab.freedesktop.org/wlroots/wlroots), that uses evilwm's
-behavior as its specification.
+evilwm by Ciaran Anscomb is a minimalist X11 window manager. evilWay is a
+new compositor, written from scratch in C using
+[wlroots](https://gitlab.freedesktop.org/wlroots/wlroots), that uses evilwm
+1.5 as its behavior specification. It is not a port — evilwm is X11-only.
 
-## What it does (when complete)
+## What it does
 
 - Floating window management only. No tiling.
-- No window decorations (or minimal: 1px border).
-- Keyboard-driven: all window operations via keyboard shortcuts.
-- **Command key** (⌘) as the modifier — maps to Super/Mod4 under Linux on
-  Apple hardware. Chosen over Alt to avoid conflicts with application shortcuts.
-- Command+drag to move windows. Command+right-drag to resize.
+- Minimal window decorations: 1px colored border.
+- Keyboard-driven: all window operations via configurable keyboard shortcuts.
+- **Super key** as the default modifier — maps to Command (⌘) on Apple
+  hardware. Configurable via `.evilwayrc`.
+- Super+drag to move windows. Super+middle-drag to resize.
 - Focus follows mouse.
-- Virtual desktops.
-- No built-in status bar — [waybar](https://github.com/Alexays/Waybar) handles that.
-
-## Current status
-
-**Scaffold (Phase 1a):** xdg-shell only. Starts a compositor session, opens an
-output, accepts xdg-shell client connections and renders them. Exits cleanly on
-Super+Shift+Q. Runtime config system implemented. No evilwm window-management
-behavior yet.
-
-### Implementation roadmap
-
-| Phase | What |
-|---|---|
-| 1a | xdg-shell scaffold ← **you are here** |
-| 1a | ✓ VT switching (Ctrl+Alt+Fn) |
-| 1a | ✓ Terminal launch (Super+Return → foot, configurable) |
-| 1a | ✓ Runtime config file (~/.evilwayrc, SIGHUP reload) |
-| 1b | wlr-layer-shell (waybar must work) |
-| 1c | ext-session-lock-v1 (swaylock must work) |
-| 1d | xdg-output, wlr-screencopy |
-| 1e | XWayland |
-| 2  | evilwm behavior layer on top of working compositor |
-| 3  | YubiKey Bio PAM integration (pam_u2f on login/sudo/swaylock) |
-
-## Configuration
-
-evilWay reads `~/.evilwayrc` on startup and reloads it when sent SIGHUP.
-File absent is not an error — built-in defaults are used silently.
-
-Format is identical to evilwm's `.evilwmrc`: one option per line, no leading
-dashes, arguments separated by whitespace, comments start with `#`.
-
-### Reload
-
-```sh
-kill -HUP $(pidof evilway)
-```
-
-The compositor continues running during the reload. If the new config cannot
-be parsed (malloc failure), the previous config is kept intact.
-
-### Options
-
-| Key | Default | Range | Description |
-|---|---|---|---|
-| `bw` | `1` | 1–20 | Window border width in pixels |
-| `snap` | `0` | 0–100 | Snap-to-edge distance in pixels (0 = disabled) |
-| `term` | `foot` | — | Terminal to spawn on the spawn bind |
-| `numvdesks` | `4` | 1–16 | Number of virtual desktops |
-| `bind` | — | — | Keyboard or mouse binding (see below) |
-
-### Bind syntax
-
-```
-bind TRIGGER=FUNCTION[,FLAGS]
-```
-
-**Trigger** — keyboard:
-```
-bind Super+Return=spawn
-bind Super+Shift+h=resize,relative+left
-bind Control+Alt+t=spawn
-```
-
-**Trigger** — mouse button (button1=left, button2=middle, button3=right):
-```
-bind button3=lower
-```
-
-**Functions:** `spawn`, `delete`, `kill`, `lower`, `raise`, `move`, `resize`,
-`fix`, `vdesk`, `next`, `dock`, `info`
-
-**Flags** (joined with `+`): `relative`, `toggle`, `top`, `bottom`, `left`,
-`right`, `up`, `down`, `horizontal` (or `h`), `vertical` (or `v`)
-
-**vdesk** accepts either flags or a bare integer desktop number (0-based):
-```
-bind Super+1=vdesk,0
-bind Super+Left=vdesk,relative+left
-bind Super+x=resize,toggle+v+h
-```
-
-**Super+Shift+Q** is the compositor emergency exit. It is hardcoded and cannot
-be removed or reassigned in the config file.
-
-Copy `evilwayrc.example` from the repo root to `~/.evilwayrc` for a working
-starting point with full documentation.
-
-## Output configuration
-
-evilWay implements the `wlr-output-management-v1` protocol. Output configuration
-(resolution, refresh rate, scale, position, orientation) is handled entirely by
-external tools — evilWay does not implement its own resolution controls.
-
-**wlr-randr** — manual, one-shot output configuration (analogous to `xrandr`):
-
-```sh
-sudo dnf install wlr-randr
-
-# List all outputs and current modes
-wlr-randr
-
-# Set a specific mode on a named output
-wlr-randr --output DP-1 --mode 2560x1440@144
-
-# Set scale (for HiDPI)
-wlr-randr --output eDP-1 --scale 2
-```
-
-**kanshi** — persistent, profile-based output configuration (different profiles for
-docked vs undocked, multiple monitor combinations):
-
-```sh
-sudo dnf install kanshi
-```
-
-Configuration lives in `~/.config/kanshi/config`, not in `~/.evilwayrc`.
-Example:
-
-```
-# Laptop standalone
-profile laptop {
-    output eDP-1 enable scale 2
-}
-
-# Docked — laptop + external monitor
-profile docked {
-    output eDP-1 enable position 1920,0 scale 2
-    output DP-1 enable mode 1920x1080@60 position 0,0
-}
-```
-
-Run kanshi at session start, not inside the compositor:
-
-```sh
-# Add to ~/.bash_profile (after evilway starts):
-kanshi &
-```
-
-kanshi reads `$WAYLAND_DISPLAY` from the environment, which evilWay sets on
-startup. It will apply the matching profile automatically.
-
-## Architecture
-
-Built on [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) 0.19, using
-[dwl](https://codeberg.org/dwl/dwl) as the primary architectural reference and
-tinywl (in the wlroots source tree) as the minimal floor.
+- Virtual desktops in a configurable columns×rows grid (default: 8×1).
+- Snap-to-border.
+- No built-in status bar — [waybar](https://github.com/Alexays/Waybar) handles
+  that.
+- Session lock via [swaylock](https://github.com/swaywm/swaylock)
+  (`ext-session-lock-v1`).
+- SIGHUP reloads configuration.
 
 ## Dependencies
 
@@ -175,19 +34,18 @@ wayland-protocols-devel
 libxkbcommon-devel
 meson
 ninja-build
-wayland-scanner   (usually part of wayland-devel)
 ```
 
 Install on Fedora 43:
 
-```sh
+```
 sudo dnf install wlroots-devel wayland-devel wayland-protocols-devel \
                  libxkbcommon-devel meson ninja-build
 ```
 
 ## Build
 
-```sh
+```
 # Debug build (default) — includes ASan + UBSan sanitizers
 meson setup build
 ninja -C build
@@ -197,17 +55,13 @@ meson setup build-release --buildtype=release
 ninja -C build-release
 ```
 
-The debug build compiles with `-fsanitize=address,undefined`. Any memory error
-or undefined behavior will be reported on stderr and the compositor will abort.
-This is intentional — we run with sanitizers throughout development.
-
 ## Run
 
 **From a TTY (primary launch path):**
 
 Add to `~/.bash_profile`:
 
-```sh
+```bash
 if [[ -z $DISPLAY && -z $WAYLAND_DISPLAY && ${XDG_VTNR:-0} -eq 1 ]]; then
     exec evilway
 fi
@@ -217,30 +71,228 @@ Log in on TTY1. The compositor starts; failure drops back to the shell prompt.
 
 **Nested (for development):**
 
-```sh
-# Inside an existing Wayland session:
+```
 ./build/evilway
 ```
 
-wlroots auto-detects the environment and opens a nested Wayland window instead
-of taking over the display.
+wlroots auto-detects the environment and opens a nested Wayland window.
+
+## Configuration
+
+evilWay reads `~/.evilwayrc` on startup. The file format is identical to
+evilwm's `.evilwmrc`: one option per line, leading dashes omitted. Options
+specified on the command line (if added later) override the config file.
+
+Send SIGHUP to reload the config without restarting:
+
+```
+kill -HUP $(pidof evilway)
+```
+
+### Example `.evilwayrc`
+
+```
+# Terminal emulator (default: foot)
+term foot
+
+# Border colors (hex RGB)
+fg #DAA520
+fc #4682B4
+bg #404040
+
+# Border width in pixels (default: 1)
+bw 1
+
+# Snap-to-border distance in pixels (0 = disabled)
+snap 10
+
+# Virtual desktop grid layout (default: 8x1)
+numvdesks 4x2
+
+# Modifier masks (default: super for mask1 and mask2, shift for altmask)
+# On Apple hardware, Command key = super.
+# To use Ctrl+Alt like original evilwm:
+#   mask1 control+alt
+#   mask2 alt
+mask1 super
+mask2 super
+altmask shift
+
+# Custom key bindings (override defaults)
+# Format: bind key[+modifier]...=function,flag+flag+...
+# Modifiers: mask1, mask2, altmask, shift, control, alt, super, mod1-mod5
+bind mask1+Return=spawn
+bind mask1+altmask+q=quit
+
+# Application rules
+# Match by Wayland app_id (use wlr-which-key or similar to discover)
+app firefox
+vdesk 1
+
+app foot
+geometry 800x600+0+0
+```
+
+### Available options
+
+| Option | Description |
+|---|---|
+| `term PROG` | Terminal to spawn (default: `foot`) |
+| `fg COLOR` | Active window border color (default: `#DAA520` goldenrod) |
+| `fc COLOR` | Fixed window border color (default: `#4682B4` steelblue) |
+| `bg COLOR` | Inactive window border color (default: `#404040` dark grey) |
+| `bw N` | Border width in pixels (default: `1`) |
+| `snap N` | Snap-to-border distance, 0 to disable (default: `0`) |
+| `numvdesks CxR` | Virtual desktop grid, e.g. `4x2` (default: `8x1`) |
+| `wholescreen` | Ignore monitor geometry, use full screen |
+| `nosoliddrag` | Draw outline instead of solid window while moving |
+| `mask1 MODS` | Primary modifier (default: `super`) |
+| `mask2 MODS` | Mouse/cycle modifier (default: `super`) |
+| `altmask MODS` | Shift modifier for variants (default: `shift`) |
+| `bind SPEC` | Key or button binding (see below) |
+| `app ID` | Start an application rule block matching `app_id` |
+| `geometry WxH+X+Y` | Set geometry for matched app |
+| `vdesk N` | Set default vdesk for matched app |
+| `fixed` | Matched app starts fixed (visible on all vdesks) |
+| `dock` | Treat matched app as a dock |
+| `ignore-position` | Ignore app-specified position for matched app |
+| `ignore-border` | Use default border width for matched app |
+
+### Default key bindings
+
+All defaults use `mask1` (Super) as the primary modifier and `altmask`
+(Shift) as the variant modifier.
+
+| Key | Action |
+|---|---|
+| Super+Return | Spawn terminal |
+| Super+Escape | Close window (co-operative) |
+| Super+Shift+Escape | Kill window (force) |
+| Super+Insert | Lower window |
+| Super+i | Show window info (logged to stderr) |
+| Super+Tab | Cycle to next window |
+| Super+h/j/k/l | Move window left/down/up/right by 16px |
+| Super+y/u/b/n | Move window to top-left/top-right/bottom-left/bottom-right corner |
+| Super+Shift+h/j/k/l | Resize window (shrink left, grow down, shrink up, grow right) |
+| Super+= | Toggle vertical maximize |
+| Super+Shift+= | Toggle horizontal maximize |
+| Super+x | Toggle full maximize (both axes) |
+| Super+d | Toggle dock visibility |
+| Super+f | Toggle window fixed (visible on all vdesks) |
+| Super+1–8 | Switch to virtual desktop 0–7 |
+| Super+Left/Right/Up/Down | Navigate virtual desktop grid |
+| Super+a | Switch to previously active virtual desktop |
+| Super+Shift+q | Quit compositor |
+
+### Default mouse bindings
+
+With Super held, anywhere in a window:
+
+| Button | Action |
+|---|---|
+| Left | Move window |
+| Middle | Resize window |
+| Right | Lower window |
+
+### Key repeat
+
+Holding a compositor key binding continuously repeats the action. This
+applies to relative move (h/j/k/l), relative resize (Shift+h/j/k/l),
+and relative vdesk navigation (arrow keys). Initial delay: 400ms, repeat
+rate: 30ms.
+
+### Bindable functions
+
+| Function | Flags | Description |
+|---|---|---|
+| `spawn` | — | Launch terminal |
+| `delete` | — | Co-operative close |
+| `kill` | — | Force kill |
+| `lower` | — | Lower window |
+| `raise` | — | Raise window |
+| `next` | — | Cycle windows |
+| `move` | `relative+{left,right,up,down}` | Move by step |
+| `move` | `{top,bottom}+{left,right}` | Move to corner |
+| `resize` | `relative+{left,right,up,down}` | Resize by step |
+| `resize` | `toggle+{v,h,v+h}` | Toggle maximize |
+| `fix` | `toggle` | Toggle fixed state |
+| `dock` | `toggle` | Toggle dock visibility |
+| `info` | — | Show window info |
+| `vdesk` | `N` (number) | Switch to vdesk N |
+| `vdesk` | `relative+{left,right,up,down}` | Navigate vdesk grid |
+| `vdesk` | `toggle` | Switch to previous vdesk |
+| `quit` | — | Exit compositor |
+
+## Architecture
+
+Built on [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) 0.19.
+[dwl](https://codeberg.org/dwl/dwl) was used as the primary architectural
+reference and tinywl as the minimal floor.
+
+### Source layout
+
+```
+src/main.c      — server init, scene graph, signal handling, event loop
+src/config.c    — .evilwayrc parser, default binds, app rules
+src/func.c      — all bindable functions (evilwm-compatible dispatch)
+src/input.c     — keyboard, pointer, focus-follows-mouse, key repeat
+src/window.c    — view lifecycle, borders, app rule matching
+src/output.c    — display management via wlr_scene
+src/vdesk.c     — virtual desktops (NxM grid)
+src/layer.c     — wlr-layer-shell-v1 (waybar, panels)
+src/lock.c      — ext-session-lock-v1 (swaylock)
+include/evilway.h — all structs, enums, prototypes
+```
+
+### Wayland protocols
+
+| Protocol | Purpose |
+|---|---|
+| xdg-shell | Normal application windows |
+| wlr-layer-shell-v1 | waybar, wofi, swaylock surfaces |
+| ext-session-lock-v1 | Session lock (swaylock) |
+
+XWayland is disabled by default (meson option). Layer-shell and session
+lock are built in and always available.
+
+### Scene graph layers (bottom to top)
+
+1. Background
+2. Bottom
+3. Views (normal windows)
+4. Top
+5. Overlay
+6. Lock (session lock surface — topmost)
 
 ## Security notes
 
-This compositor is the security boundary between all input and all rendered
-output on the machine.
+This compositor is the security boundary between all input and all
+rendered output.
 
-- **Socket:** The Wayland socket is created in `$XDG_RUNTIME_DIR` with 0600
-  permissions. Verify on startup: `ls -la $XDG_RUNTIME_DIR/wayland-*`
-- **Input:** Compositor keybindings (Super+Shift+Q, etc.) are consumed before
-  any key event reaches a client.
-- **Session lock:** `ext-session-lock-v1` (Phase 1c) is a hard requirement —
-  swaylock uses it. The implementation must correctly inhibit all client input
-  while locked, not just render a lock surface.
-- **XWayland** (Phase 1e): X11 clients can keylog across windows within
-  XWayland. Included for compatibility; documented where wired in.
+- **Input**: compositor keybindings are consumed before reaching clients.
+  No client can intercept Super+Shift+Q or the lock invocation.
+- **Session lock**: when locked, ALL input is routed only to the lock
+  surface. If the lock surface is destroyed without unlocking, the session
+  stays locked. There is no compositor bypass. Recovery is via TTY.
+- **Socket**: Wayland socket is created with 0600 permissions in
+  `$XDG_RUNTIME_DIR`.
+- **Sanitizers**: debug builds run with `-fsanitize=address,undefined`.
+  All development should use debug builds.
 
 ## Privileges
 
-Run as the session user. The `video` and `input` group memberships are required
-for DRM/KMS access on Fedora — not root. Verify with `groups $(whoami)`.
+Run as the session user. Requires `video` and `input` group membership
+for DRM/KMS access. Not root.
+
+```
+groups $(whoami)    # should include video, input
+```
+
+## Credits
+
+- [evilwm](https://www.6809.org.uk/evilwm/) by Ciaran Anscomb — the
+  behavior specification
+- [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) — the
+  compositor library
+- [dwl](https://codeberg.org/dwl/dwl) — architectural reference
+- [tinywl](https://gitlab.freedesktop.org/wlroots/wlroots/-/tree/master/tinywl)   — minimal wlroots example

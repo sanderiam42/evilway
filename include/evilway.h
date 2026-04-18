@@ -1,19 +1,19 @@
-/* evilway.h — shared type definitions for the evilWay compositor
+/* evilWay — Wayland compositor implementing evilwm behavior
  *
- * Struct definitions and constants only. No implementation here.
+ * Not a port.  evilwm is X11-only.  evilWay is a new compositor written
+ * in C on wlroots, using evilwm 1.5 as the behavior specification.
  *
- * Target: wlroots-0.19 (Fedora 43: 0.19.2-1.fc43)
+ * evilwm by Ciaran Anscomb: https://www.6809.org.uk/evilwm/
+ * wlroots: https://gitlab.freedesktop.org/wlroots/wlroots
+ * Architectural reference: dwl (https://codeberg.org/dwl/dwl)
  */
+
 #ifndef EVILWAY_H
 #define EVILWAY_H
 
 #include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
-#include <wlr/backend/session.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
@@ -21,362 +21,400 @@
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
-#include <wlr/types/wlr_output_management_v1.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
+#include <wlr/types/wlr_session_lock_v1.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
-#include "window.h"
+/* ── Limits ─────────────────────────────────────────────────────────── */
 
-/*
- * Compositor modifier key.
- *
- * Super (Mod4) maps to the Command (⌘) key on Apple keyboards under
- * Linux/Asahi. This deliberately diverges from evilwm's Alt-based bindings:
- * Command is the natural "WM key" on this hardware and avoids conflicts
- * with terminal and application Alt shortcuts.
- *
- * Used exclusively for the hardcoded Super+Shift+Q emergency exit, which is
- * not user-configurable. All other bindings use the EwConfig bind system.
- */
-#define MODIFIER WLR_MODIFIER_LOGO
+#define EW_MAX_BINDS        128
+#define EW_MAX_APP_RULES    64
 
-/*
- * Movement and resize constants.
- *
- * MOVE_STEP matches evilwm's default 16-pixel keyboard increment for both
- * move and resize operations. MIN_WIN_CONTENT is the minimum CLIENT content
- * dimension (not including borders); outer minimum = MIN_WIN_CONTENT + 2*bw.
- */
-#define MOVE_STEP        16   /* keyboard move/resize step in pixels */
-#define MIN_WIN_CONTENT  32   /* minimum client content width or height */
+/* ── Defaults ───────────────────────────────────────────────────────── */
 
-/*
- * Border colors as packed RGBA uint32_t (0xRRGGBBAA).
- *
- * BORDER_COLOR_ACTIVE matches evilwm's classic gold (#DAA520).
- * BORDER_COLOR_INACTIVE is dark grey (#444444).
- *
- * These are compile-time constants, not config values. Color configuration
- * will be added in a later pass when the .evilwayrc color keys are defined.
- *
- * SECURITY: Both values are literals — no client-supplied input can influence
- * border rendering colors.
- */
-#define BORDER_COLOR_ACTIVE   0xDAA520FFu  /* evilwm gold */
-#define BORDER_COLOR_INACTIVE 0x444444FFu  /* dark grey */
+/* DECISION: mask1 defaults to Super (Mod4), not Ctrl+Alt like evilwm.
+ * Rationale: on Apple hardware, Command maps to Super/Mod4.  Using
+ * Ctrl+Alt would collide with terminal emulator binds (Ctrl+Alt+T, etc).
+ * mask2 also defaults to Super for consistency.  Users can override
+ * via .evilwayrc just like evilwm's .evilwmrc. */
 
-/* =========================================================================
- * Runtime config — bind flags, function enum, bind and config structs.
- *
- * These are populated by src/config.c from ~/.evilwayrc on startup and on
- * SIGHUP. The compile-time "#define TERMINAL" is gone; the terminal is now
- * EwConfig.terminal, defaulting to "foot" when no config file is present.
- * ====================================================================== */
+#define EW_DEFAULT_BW         1
+#define EW_DEFAULT_SNAP       0       /* 0 = snap disabled */
+#define EW_DEFAULT_VDESKS_C   8
+#define EW_DEFAULT_VDESKS_R   1
+#define EW_DEFAULT_MOVE_STEP  16
+#define EW_DEFAULT_TERM       "foot"
 
-/*
- * Flags for bind actions. Combine with | to express compound behaviors:
- *   FLAG_RELATIVE|FLAG_LEFT  → move/resize incrementally leftward
- *   FLAG_TOGGLE|FLAG_VERTICAL|FLAG_HORIZONTAL → full maximize toggle
- *   FLAG_TOP|FLAG_LEFT       → snap window to top-left corner
- */
-#define FLAG_RELATIVE    (1u << 0)
-#define FLAG_TOGGLE      (1u << 1)
-#define FLAG_TOP         (1u << 2)
-#define FLAG_BOTTOM      (1u << 3)
-#define FLAG_LEFT        (1u << 4)
-#define FLAG_RIGHT       (1u << 5)
-#define FLAG_UP          (1u << 6)
-#define FLAG_DOWN        (1u << 7)
-#define FLAG_HORIZONTAL  (1u << 8)
-#define FLAG_VERTICAL    (1u << 9)
+/* Key repeat for compositor bindings (ms) */
+#define EW_REPEAT_DELAY_MS    400
+#define EW_REPEAT_RATE_MS     30
 
-/* Window-management functions available to user-defined binds. */
-typedef enum {
-    FUNC_SPAWN,   /* spawn the configured terminal */
-    FUNC_DELETE,  /* request window close (graceful) */
-    FUNC_KILL,    /* force-kill window's client */
-    FUNC_LOWER,   /* lower window in stacking order */
-    FUNC_RAISE,   /* raise window to top of stack */
-    FUNC_MOVE,    /* move window (flags: relative+dir, corner) */
-    FUNC_RESIZE,  /* resize window (flags: relative+dir, toggle) */
-    FUNC_FIX,     /* toggle window fixed (sticky across vdesks) */
-    FUNC_VDESK,   /* switch virtual desktop (flags or vdesk_target) */
-    FUNC_NEXT,    /* cycle focus to next window */
-    FUNC_DOCK,    /* toggle dock visibility */
-    FUNC_INFO,    /* show window info overlay */
-} EwFunction;
+/* ── Function flags (mirrors evilwm func.h architecture) ────────────
+ * Lower 8 bits: numeric value (vdesk number, etc.)
+ * Upper bits: behavioral flags.
+ * Packing value+flags into one unsigned is evilwm's design; we keep it. */
 
-/*
- * EwBind — a single keybinding or mouse button binding.
- *
- * is_mouse=false: keyboard bind. Match on modifiers (WLR_MODIFIER_* bits)
- *   and keysym (resolved by xkb_keysym_from_name() at config parse time).
- * is_mouse=true:  mouse button bind. Match on button (1–5, config numbering).
- *   The evdev↔config mapping is done in main.c at dispatch time.
- *
- * vdesk_target: for FUNC_VDESK with a bare integer target (e.g. "vdesk,0").
- *   Set to -1 when not applicable (all other functions, and vdesk with flags).
- */
-typedef struct {
-    bool         is_mouse;
-    uint32_t     modifiers;     /* WLR_MODIFIER_* bitmask; 0 for mouse binds */
-    xkb_keysym_t keysym;        /* XKB keysym; XKB_KEY_NoSymbol for mouse binds */
-    uint32_t     button;        /* 1–5 (config numbering); 0 for keyboard binds */
-    EwFunction   function;
-    uint32_t     flags;         /* FLAG_* bitmask */
-    int          vdesk_target;  /* desktop index for vdesk,N; -1 if unused */
-} EwBind;
+#define FL_VALUEMASK  (0xff)
+#define FL_UP         (1 << 8)
+#define FL_DOWN       (1 << 9)
+#define FL_LEFT       (1 << 10)
+#define FL_RIGHT      (1 << 11)
+#define FL_TOP        (1 << 12)
+#define FL_BOTTOM     (1 << 13)
+#define FL_RELATIVE   (1 << 14)
+#define FL_TOGGLE     (1 << 18)
 
-/*
- * EwConfig — full compositor runtime configuration.
- *
- * Lives inside struct Server on the stack. Populated by config_load() and
- * freed by config_free(). config_set_defaults() establishes fallback values
- * used when no config file is present.
- *
- * SECURITY: terminal[] is bounded to 255 chars + NUL. All string fields are
- * fixed-size arrays. No unbounded heap strings in this struct.
- */
-typedef struct {
-    int    border_width;     /* bw: window border width in pixels (default 1, range 1–20) */
-    int    snap_distance;    /* snap: snap-to-edge distance in pixels (default 0=disabled, range 0–100) */
-    char   terminal[256];    /* term: terminal to spawn on FUNC_SPAWN (default "foot") */
-    int    num_vdesks;       /* numvdesks: number of virtual desktops (default 4, range 1–16) */
-    EwBind *binds;           /* heap-allocated array of key/mouse bindings */
-    size_t  num_binds;       /* number of valid entries in binds[] */
-    size_t  binds_capacity;  /* allocated capacity of binds[] */
-} EwConfig;
+/* Convenience combos */
+#define FL_TOPLEFT      (FL_TOP | FL_LEFT)
+#define FL_TOPRIGHT     (FL_TOP | FL_RIGHT)
+#define FL_BOTTOMLEFT   (FL_BOTTOM | FL_LEFT)
+#define FL_BOTTOMRIGHT   (FL_BOTTOM | FL_RIGHT)
+#define FL_VERT         (FL_TOP | FL_BOTTOM)
+#define FL_HORZ         (FL_LEFT | FL_RIGHT)
 
-/* =========================================================================
- * Scene layer z-ordering.
- *
- * Layer trees are created as children of the root wlr_scene in this order.
- * Lower index = rendered first (bottom), higher index = rendered last (top).
- *
- * Matches dwl's layer model with tiling-specific layers removed (evilWay is
- * floating-only). Additional layers (LyrBottom, LyrOverlay, etc.) will be
- * inserted here as protocols are added in subsequent phases.
- *
- * SECURITY: LyrBlock must remain the topmost layer. Session lock surfaces
- * (ext-session-lock-v1, Phase 2) will be placed here, above all client content.
- * If any other layer is accidentally placed above LyrBlock, the lock screen
- * can be obscured and input may reach client windows while locked.
- * ====================================================================== */
+/* ── Enumerations ───────────────────────────────────────────────────── */
+
+enum ew_cursor_mode {
+	EW_CURSOR_PASSTHROUGH,
+	EW_CURSOR_MOVE,
+	EW_CURSOR_RESIZE,
+};
+
+/* Bindable function IDs — matches evilwm's function list exactly */
+enum ew_func_id {
+	EW_FUNC_NONE = 0,
+	EW_FUNC_SPAWN,
+	EW_FUNC_DELETE,
+	EW_FUNC_KILL,
+	EW_FUNC_LOWER,
+	EW_FUNC_RAISE,
+	EW_FUNC_NEXT,
+	EW_FUNC_MOVE,
+	EW_FUNC_RESIZE,
+	EW_FUNC_FIX,
+	EW_FUNC_DOCK,
+	EW_FUNC_INFO,
+	EW_FUNC_VDESK,
+	/* compositor-only, not in evilwm */
+	EW_FUNC_QUIT,
+};
+
+enum ew_bind_type {
+	EW_BIND_KEY,
+	EW_BIND_BUTTON,
+};
+
+/* Border rect indices */
 enum {
-    LyrBg,      /* solid background fill */
-    LyrFloat,   /* all toplevel windows — evilWay is floating-only */
-    LyrTop,     /* reserved: wlr-layer-shell top/overlay surfaces (Phase 2) */
-    LyrBlock,   /* reserved: ext-session-lock-v1 lock surfaces (Phase 2) */
-    LYR_COUNT
+	BORDER_TOP = 0,
+	BORDER_BOTTOM,
+	BORDER_LEFT,
+	BORDER_RIGHT,
+	BORDER_COUNT,
 };
 
-/*
- * EwCursorMode — tracks whether the compositor has an active mouse grab.
- *
- * CurNormal:  no grab; pointer events are forwarded to clients normally.
- * CurMove:    Super+button1 drag in progress; compositor is moving a window.
- * CurResize:  Super+button2 drag in progress; compositor is resizing a window.
- *
- * SECURITY: While cursor_mode != CurNormal, the compositor consumes ALL
- * pointer motion and button events without forwarding them to any client.
- * This is enforced in process_cursor_motion() and handle_cursor_button() in
- * main.c. A client that receives pointer events during a compositor grab is
- * a correctness bug and a potential security issue (it can observe cursor
- * position outside its own surface).
- */
-typedef enum { CurNormal, CurMove, CurResize } EwCursorMode;
-
-/*
- * Server — top-level compositor state.
- *
- * One instance, lives on the stack in main(). Passed by pointer to all
- * handlers via wl_container_of(). Do not heap-allocate this struct.
- */
-struct Server {
-    struct wl_display            *display;
-    struct wlr_backend           *backend;
-    struct wlr_renderer          *renderer;
-    struct wlr_allocator         *allocator;
-
-    /* Populated by wlr_backend_autocreate() on DRM/KMS (bare hardware).
-     * NULL when running nested (Wayland/X11 backend). Used for VT switching.
-     * wlr_session_change_vt() is a no-op when session is NULL. */
-    struct wlr_session           *session;
-
-    /* Scene graph: all rendering flows through here.
-     * Never bypass wlr_scene — direct rendering breaks damage tracking,
-     * screencopy, and session lock. */
-    struct wlr_scene             *scene;
-    struct wlr_scene_tree        *layers[LYR_COUNT];
-    struct wlr_scene_output_layout *scene_layout;
-
-    struct wlr_output_layout     *output_layout;
-    struct wl_list                outputs;    /* Output::link */
-
-    /* wlr-output-management-v1 — lets wlr-randr and kanshi configure outputs.
-     * NULL if wlr_output_manager_v1_create() failed at init time (non-fatal:
-     * compositor runs without output management support in that case).
-     *
-     * SECURITY: wlroots does not authenticate clients using this protocol.
-     * See the security note in src/output.c. */
-    struct wlr_output_manager_v1 *output_manager;
-    struct wl_listener            output_manager_apply;
-    struct wl_listener            output_manager_test;
-
-    struct wlr_xdg_shell         *xdg_shell;
-    struct wl_list                toplevels;  /* Toplevel::link, front = focused */
-
-    /* Keyboard list — one Keyboard per physical keyboard device.
-     * TODO: migrate to wlr_keyboard_group so modifier state is consistent
-     * across all simultaneously connected keyboards (e.g. built-in + external).
-     * dwl uses wlr_keyboard_group for this reason. */
-    struct wl_list                keyboards;  /* Keyboard::link */
-
-    struct wlr_cursor            *cursor;
-    struct wlr_xcursor_manager   *cursor_mgr;
-    struct wlr_seat              *seat;
-
-    /* Runtime configuration — loaded from ~/.evilwayrc on startup and SIGHUP.
-     * All WM policy decisions (border width, terminal, keybindings) come from
-     * here. Never reference TERMINAL or hardcoded keysyms directly — use this
-     * struct (except Super+Shift+Q which is hardcoded as compositor emergency
-     * exit and is intentionally not user-configurable). */
-    EwConfig                      config;
-
-    /* wl_event_loop signal source for SIGHUP config reload.
-     * Uses signalfd internally — the callback runs in normal event loop
-     * context, not from a signal handler, so malloc is safe. */
-    struct wl_event_source       *sighup_source;
-
-    /*
-     * Mouse grab state — active during Super+drag move/resize operations.
-     *
-     * SECURITY: while cursor_mode != CurNormal ALL pointer motion events and
-     * button events are consumed by the compositor and NOT forwarded to any
-     * client. Enforcement is in process_cursor_motion() and
-     * handle_cursor_button() in main.c.
-     *
-     * grab_anchor_x/y serves dual purpose:
-     *   CurMove:   cursor offset from window origin at grab start
-     *              (new_win_x = cursor_x - grab_anchor_x)
-     *   CurResize: position of the anchored (opposite) corner in layout space
-     *              (the drag corner tracks the cursor; anchor corner is fixed)
-     */
-    EwCursorMode      cursor_mode;
-    struct Toplevel  *grab_tl;        /* window being moved/resized */
-    struct wlr_box    grab_geom;      /* window geometry at grab start */
-    int               grab_anchor_x;
-    int               grab_anchor_y;
-
-    /* Backend-level listeners */
-    struct wl_listener new_output;
-    struct wl_listener new_input;
-
-    /* XDG shell listeners */
-    struct wl_listener new_xdg_toplevel;
-    struct wl_listener new_xdg_popup;
-
-    /* Cursor (pointer) listeners */
-    struct wl_listener cursor_motion;
-    struct wl_listener cursor_motion_absolute;
-    struct wl_listener cursor_button;
-    struct wl_listener cursor_axis;
-    struct wl_listener cursor_frame;
-
-    /* Seat listeners */
-    struct wl_listener request_cursor;
-    struct wl_listener pointer_focus_change;
-    struct wl_listener request_set_selection;
+/* Scene-tree layer ordering */
+enum ew_layer {
+	EW_LAYER_BACKGROUND = 0,
+	EW_LAYER_BOTTOM,
+	EW_LAYER_VIEWS,      /* normal windows live here */
+	EW_LAYER_TOP,
+	EW_LAYER_OVERLAY,
+	EW_LAYER_LOCK,        /* session-lock surface */
+	EW_LAYER_COUNT,
 };
 
-/*
- * Output — per-display state.
- * One instance per connected monitor. Created on backend new_output event.
- */
-struct Output {
-    struct wl_list           link;
-    struct Server           *server;
-    struct wlr_output       *wlr_output;
-    struct wlr_scene_output *scene_output; /* links scene graph to this output */
+/* ── Structures ─────────────────────────────────────────────────────── */
 
-    struct wl_listener frame;
-    struct wl_listener request_state;
-    struct wl_listener destroy;
+struct ew_server;
+
+/* ── Bind ───────────────────────────────────────────────────────────── */
+
+struct ew_bind {
+	enum ew_bind_type type;
+	xkb_keysym_t      keysym;    /* for key binds */
+	uint32_t           button;    /* for button binds (BTN_LEFT etc) */
+	uint32_t           modifiers; /* WLR_MODIFIER_* bitmask */
+	enum ew_func_id    func;
+	unsigned           flags;     /* FL_* | value in lower 8 bits */
 };
 
-/*
- * Toplevel — an xdg_toplevel application window.
- * One instance per window. Created on xdg_shell new_toplevel event.
- */
-struct Toplevel {
-    struct wl_list             link;        /* Server::toplevels */
-    struct Server             *server;
-    struct wlr_xdg_toplevel   *xdg_toplevel;
+/* ── Application matching rule ──────────────────────────────────────── */
 
-    /*
-     * Scene graph structure for this window:
-     *
-     *   scene_tree (outer container, in LyrFloat)
-     *   ├── border[0]   top rect,    full width × bw
-     *   ├── border[1]   bottom rect, full width × bw
-     *   ├── border[2]   left rect,   bw × (height - 2*bw)
-     *   ├── border[3]   right rect,  bw × (height - 2*bw)
-     *   └── surface_tree (xdg surface, positioned at (bw, bw))
-     *
-     * scene_tree is positioned at (geom.x, geom.y) in layout space.
-     * scene_tree->node.data = this Toplevel, used by toplevel_at() hit test.
-     *
-     * DESIGN: outer tree + separate surface_tree matches dwl's c->scene /
-     * c->scene_surface split. It lets us size and color borders independently
-     * of the client surface without involving the xdg protocol machinery.
-     */
-    struct wlr_scene_tree     *scene_tree;   /* outer container; node.data = this */
-    struct wlr_scene_tree     *surface_tree; /* xdg surface, at (bw,bw) in outer */
-    struct wlr_scene_rect     *border[4];    /* top, bottom, left, right */
-
-    /* Per-window mutable state: geometry, maximize flags, vdesk, fixed. */
-    EwWindowState              state;
-
-    struct wl_listener map;
-    struct wl_listener unmap;
-    struct wl_listener commit;
-    struct wl_listener destroy;
-    struct wl_listener request_move;
-    struct wl_listener request_resize;
-    struct wl_listener request_maximize;
-    struct wl_listener request_fullscreen;
+struct ew_app_rule {
+	char    *app_id;             /* Wayland app_id (was WM_CLASS in X11) */
+	bool     has_geometry;
+	int      gx, gy, gw, gh;    /* parsed geometry */
+	int      vdesk;              /* -1 = no preference */
+	bool     fixed;
+	bool     is_dock;
+	bool     ignore_position;
+	bool     ignore_border;
 };
 
-/*
- * Popup — an xdg_popup transient window (menus, tooltips, etc.).
- * Managed by the scene graph; minimal compositor involvement needed.
- */
-struct Popup {
-    struct wlr_xdg_popup *xdg_popup;
-    struct wl_listener commit;
-    struct wl_listener destroy;
+/* ── Configuration ──────────────────────────────────────────────────── */
+
+struct ew_config {
+	char    *term;
+
+	/* Border colors (RGBA as float[4] for wlr_scene_rect) */
+	float    fg[4];              /* active window */
+	float    fc[4];              /* fixed window */
+	float    bg[4];              /* inactive window */
+
+	int      border_width;
+	int      snap;
+	int      move_step;
+	bool     nosoliddrag;
+	bool     wholescreen;
+
+	int      vdesks_cols;
+	int      vdesks_rows;
+
+	/* Modifier masks — stored as WLR_MODIFIER_* bitmask */
+	uint32_t mask1;
+	uint32_t mask2;
+	uint32_t altmask;
+
+	/* Binds */
+	struct ew_bind binds[EW_MAX_BINDS];
+	int            num_binds;
+
+	/* App rules */
+	struct ew_app_rule app_rules[EW_MAX_APP_RULES];
+	int                num_app_rules;
 };
 
-/*
- * Keyboard — per-physical-keyboard state.
- * Holds listeners for key events and the destroy event for hot-unplug.
- */
-struct Keyboard {
-    struct wl_list         link;   /* Server::keyboards */
-    struct Server         *server;
-    struct wlr_keyboard   *wlr_keyboard;
+/* ── View (client window) ───────────────────────────────────────────── */
 
-    struct wl_listener modifiers;
-    struct wl_listener key;
-    struct wl_listener destroy;
+struct ew_view {
+	struct wl_list              link;       /* ew_server.views */
+	struct ew_server           *server;
+	struct wlr_xdg_toplevel    *xdg_toplevel;
+	struct wlr_scene_tree      *scene_tree;
+
+	/* Border rects — four edges around the surface */
+	struct wlr_scene_rect      *border[BORDER_COUNT];
+
+	/* State */
+	int      x, y;              /* compositor-space position */
+	int      vdesk;
+	bool     fixed;             /* visible on all vdesks */
+	bool     is_dock;
+	bool     mapped;
+	bool     urgent;
+
+	/* Maximize toggle state (evilwm saves geometry before maximize) */
+	bool     maximized_h;
+	bool     maximized_v;
+	int      save_x, save_y, save_w, save_h;
+
+	/* Listeners */
+	struct wl_listener map;
+	struct wl_listener unmap;
+	struct wl_listener commit;
+	struct wl_listener destroy;
+	struct wl_listener request_move;
+	struct wl_listener request_resize;
+	struct wl_listener request_maximize;
+	struct wl_listener request_fullscreen;
+	struct wl_listener set_title;
+	struct wl_listener set_app_id;
 };
+
+/* ── Layer surface ──────────────────────────────────────────────────── */
+
+struct ew_layer_surface {
+	struct wl_list                  link;
+	struct wlr_layer_surface_v1    *layer_surface;
+	struct wlr_scene_layer_surface_v1 *scene;
+	struct ew_server               *server;
+
+	struct wl_listener map;
+	struct wl_listener unmap;
+	struct wl_listener destroy;
+	struct wl_listener commit;
+};
+
+/* ── Output ─────────────────────────────────────────────────────────── */
+
+struct ew_output {
+	struct wl_list          link;
+	struct ew_server       *server;
+	struct wlr_output      *wlr_output;
+	struct wlr_scene_output *scene_output;
+
+	struct wl_listener frame;
+	struct wl_listener request_state;
+	struct wl_listener destroy;
+};
+
+/* ── Keyboard ───────────────────────────────────────────────────────── */
+
+struct ew_keyboard {
+	struct wl_list          link;
+	struct ew_server       *server;
+	struct wlr_keyboard    *wlr_keyboard;
+
+	struct wl_listener modifiers;
+	struct wl_listener key;
+	struct wl_listener destroy;
+};
+
+/* ── Session lock ───────────────────────────────────────────────────── */
+
+struct ew_session_lock {
+	struct wlr_session_lock_v1 *lock;
+	struct wlr_scene_tree      *scene_tree;
+	struct ew_server           *server;
+
+	struct wl_listener new_surface;
+	struct wl_listener unlock;
+	struct wl_listener destroy;
+};
+
+/* ── Key repeat for compositor bindings ─────────────────────────────── */
+
+struct ew_key_repeat {
+	struct wl_event_source *timer;
+	struct ew_bind         *bind;
+	bool                    active;
+};
+
+/* ── Server (top-level state) ───────────────────────────────────────── */
+
+struct ew_server {
+	struct wl_display          *wl_display;
+	struct wlr_backend         *backend;
+	struct wlr_renderer        *renderer;
+	struct wlr_allocator       *allocator;
+
+	/* Scene graph */
+	struct wlr_scene                *scene;
+	struct wlr_scene_output_layout  *scene_layout;
+	struct wlr_scene_tree           *layers[EW_LAYER_COUNT];
+
+	/* Shells */
+	struct wlr_xdg_shell          *xdg_shell;
+	struct wlr_layer_shell_v1     *layer_shell;
+	struct wlr_session_lock_manager_v1 *session_lock_mgr;
+
+	/* Output */
+	struct wlr_output_layout *output_layout;
+	struct wl_list            outputs;
+
+	/* Input */
+	struct wlr_seat    *seat;
+	struct wlr_cursor  *cursor;
+	struct wlr_xcursor_manager *cursor_mgr;
+	struct wl_list      keyboards;
+
+	/* Grab state — move/resize in progress */
+	enum ew_cursor_mode cursor_mode;
+	struct ew_view     *grabbed_view;
+	double              grab_x, grab_y;
+	struct wlr_box      grab_geobox;
+	uint32_t            resize_edges;
+
+	/* Window list */
+	struct wl_list      views;
+	struct ew_view     *focused_view;
+
+	/* Virtual desktops */
+	int current_vdesk;
+	int prev_vdesk;
+
+	/* Dock visibility */
+	bool docks_visible;
+
+	/* Session lock */
+	struct ew_session_lock *active_lock;
+
+	/* Key repeat for compositor binds */
+	struct ew_key_repeat key_repeat;
+
+	/* Configuration */
+	struct ew_config config;
+
+	/* Listeners — shell events */
+	struct wl_listener new_xdg_toplevel;
+	struct wl_listener new_xdg_popup;
+	struct wl_listener new_layer_surface;
+	struct wl_listener new_session_lock;
+
+	/* Listeners — output */
+	struct wl_listener new_output;
+
+	/* Listeners — input */
+	struct wl_listener new_input;
+	struct wl_listener cursor_motion;
+	struct wl_listener cursor_motion_absolute;
+	struct wl_listener cursor_button;
+	struct wl_listener cursor_axis;
+	struct wl_listener cursor_frame;
+	struct wl_listener request_cursor;
+	struct wl_listener request_set_selection;
+};
+
+/* ── Function prototypes ────────────────────────────────────────────── */
+
+/* config.c */
+void config_init(struct ew_config *cfg);
+void config_load(struct ew_config *cfg, const char *path);
+void config_destroy(struct ew_config *cfg);
+
+/* input.c */
+void input_init(struct ew_server *server);
+void input_focus_view(struct ew_server *server, struct ew_view *view);
+void input_process_cursor_motion(struct ew_server *server, uint32_t time);
+
+/* output.c */
+void output_init(struct ew_server *server);
+
+/* window.c */
+struct ew_view *view_at(struct ew_server *server, double lx, double ly,
+                        struct wlr_surface **surface, double *sx, double *sy);
+void view_focus(struct ew_server *server, struct ew_view *view);
+void view_set_position(struct ew_view *view, int x, int y);
+void view_update_borders(struct ew_view *view);
+void view_apply_app_rules(struct ew_view *view);
+void window_init(struct ew_server *server);
+
+/* vdesk.c */
+void vdesk_switch(struct ew_server *server, int vdesk);
+void vdesk_switch_relative(struct ew_server *server, unsigned flags);
+void vdesk_switch_toggle(struct ew_server *server);
+void vdesk_update_visibility(struct ew_server *server);
+
+/* func.c — bindable functions (evilwm-compatible dispatch) */
+void func_spawn(struct ew_server *server, unsigned flags);
+void func_delete(struct ew_server *server, unsigned flags);
+void func_kill(struct ew_server *server, unsigned flags);
+void func_lower(struct ew_server *server, unsigned flags);
+void func_raise(struct ew_server *server, unsigned flags);
+void func_next(struct ew_server *server, unsigned flags);
+void func_move(struct ew_server *server, unsigned flags);
+void func_resize(struct ew_server *server, unsigned flags);
+void func_fix(struct ew_server *server, unsigned flags);
+void func_dock(struct ew_server *server, unsigned flags);
+void func_info(struct ew_server *server, unsigned flags);
+void func_vdesk(struct ew_server *server, unsigned flags);
+void func_dispatch(struct ew_server *server, enum ew_func_id func,
+                   unsigned flags);
+
+/* layer.c */
+void layer_init(struct ew_server *server);
+
+/* lock.c */
+void lock_init(struct ew_server *server);
 
 #endif /* EVILWAY_H */
