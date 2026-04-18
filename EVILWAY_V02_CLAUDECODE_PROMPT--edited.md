@@ -8,7 +8,7 @@ Read `EVILWAY_CONTEXT.md` first. It is still the ground truth for platform and a
 
 The repo currently contains a Phase 1a scaffold: a single `src/main.c` that starts a bare compositor, renders one xdg-shell surface, and exits on Super+Shift+Q. No window management, no config, no layer-shell, no session lock, no virtual desktops.
 
-That scaffold is being **replaced entirely** with a complete evilwm-behavior compositor. Every line of the old `src/main.c` and `include/evilway.h` is superseded. This is not a merge — it is a clean replacement.
+That scaffold is being **replaced entirely** with a complete evilwm-behavior compositor. Every line of the old `src/main.c` and `include/evilway.h` is superseded. This is not a merge — it is a clean replacement. You will find the new code in a compressed tar file named `evilway-0.2-dev.tar.gz` in the repo directory. 
 
 ---
 
